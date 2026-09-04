@@ -52,6 +52,9 @@ members = [
   'internal/backends/selector',
   'internal/backends/testing',
   'internal/backends/linuxkms',
+  # sgc fork of the linuxkms backend (sgc-lease work). NOT in default-members:
+  # only built on demand / by path dependents.
+  'internal/backends/linuxsgc',
   'internal/renderers/software',
   'internal/renderers/skia',
   'internal/renderers/femtovg',
