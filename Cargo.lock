@@ -5262,6 +5262,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "i-slint-backend-linuxsgc"
+version = "1.17.1"
+dependencies = [
+ "bytemuck",
+ "calloop 0.14.4",
+ "cfg_aliases",
+ "drm",
+ "fontique",
+ "gbm",
+ "glutin",
+ "i-slint-common",
+ "i-slint-core",
+ "i-slint-renderer-femtovg",
+ "i-slint-renderer-software",
+ "input",
+ "memmap2",
+ "nix",
+ "raw-window-handle",
+ "xkbcommon",
+]
+
+[[package]]
 name = "i-slint-backend-qt"
 version = "1.17.1"
 dependencies = [

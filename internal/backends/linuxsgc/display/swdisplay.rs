@@ -16,17 +16,10 @@ pub trait SoftwareBufferDisplay {
             drm::buffer::DrmFourcc,
         ) -> Result<(), PlatformError>,
     ) -> Result<(), PlatformError>;
-    /// Returns true if the buffer handed out by `map_back_buffer` is in
-    /// write-combined or otherwise uncached memory, where CPU reads are an
-    /// order of magnitude slower than reads from regular (cached) memory.
-    /// Renderers that read back destination pixels should then render into a
-    /// regular buffer and copy the result into the mapped buffer.
-    fn is_write_combined_memory(&self) -> bool;
     fn as_presenter(self: Arc<Self>) -> Arc<dyn super::Presenter>;
 }
 
 mod dumbbuffer;
-mod linuxfb;
 
 pub fn negotiate_format(
     renderer_formats: &[drm::buffer::DrmFourcc],
@@ -42,18 +35,8 @@ pub fn new(
     device_opener: &crate::DeviceOpener,
     renderer_formats: &[drm::buffer::DrmFourcc],
 ) -> Result<Arc<dyn SoftwareBufferDisplay>, PlatformError> {
-    if std::env::var_os("SLINT_BACKEND_LINUXFB").is_some() {
-        return linuxfb::LinuxFBDisplay::new(device_opener, renderer_formats);
-    }
-    dumbbuffer::DumbBufferDisplay::new(device_opener, renderer_formats).or_else(
-        |dumb_buffer_error| {
-            linuxfb::LinuxFBDisplay::new(device_opener, renderer_formats).map_err(
-                |linuxfb_error| {
-                    PlatformError::Other(format!(
-                        "Could not initialize software display.\nError using DRM dumb buffers: {dumb_buffer_error}\nError using legacy framebuffer: {linuxfb_error}"
-                    ))
-                },
-            )
-        },
-    )
+    // sgc fork: the display is ALWAYS the DRM device the renderer was given —
+    // a lease fd granted by the sgc daemon. No /dev/fb0 fallback: rendering
+    // on anything but the granted device is not an option (sgc or die).
+    dumbbuffer::DumbBufferDisplay::new(device_opener, renderer_formats)
 }

@@ -10,9 +10,9 @@ pub trait Presenter {
     fn present(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
 }
 
-#[cfg(any(feature = "renderer-skia-opengl", feature = "renderer-femtovg"))]
+#[cfg(feature = "renderer-femtovg")]
 pub mod gbmdisplay;
-#[cfg(any(enable_skia, feature = "renderer-software"))]
+#[cfg(feature = "renderer-software")]
 pub mod swdisplay;
 
 /// This enum describes the way the output is supposed to be rotated to simulate
@@ -80,27 +80,6 @@ impl RenderingRotation {
                 (-(screen_size.width as f32), -(screen_size.height as f32))
             }
             RenderingRotation::Rotate270 => (-(screen_size.height as f32), 0.),
-        }
-    }
-}
-
-#[cfg(any(enable_skia, feature = "renderer-software"))]
-pub(crate) mod noop_presenter {
-    use std::sync::Arc;
-
-    // Used when the underlying renderer/display takes care of the presentation to the display
-    // and (hopefully) implements vsync.
-    pub(crate) struct NoopPresenter {}
-
-    impl NoopPresenter {
-        pub(crate) fn new() -> Arc<Self> {
-            Arc::new(Self {})
-        }
-    }
-
-    impl crate::display::Presenter for NoopPresenter {
-        fn present(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-            Ok(())
         }
     }
 }

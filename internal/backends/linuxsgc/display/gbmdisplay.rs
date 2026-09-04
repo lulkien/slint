@@ -62,12 +62,13 @@ impl GbmDisplay {
     }
 
     pub fn filter_gl_config(&self, config: &glutin::config::Config) -> bool {
+        // glutin is compiled with only the EGL backend (features "egl",
+        // "libloading"), so Config is exactly the Egl variant here.
         match &config {
             glutin::config::Config::Egl(egl_config) => {
                 drm::buffer::DrmFourcc::try_from(egl_config.native_visual())
                     == Ok(self.surface_format)
             }
-            _ => false,
         }
     }
 }

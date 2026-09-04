@@ -1,9 +1,8 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-//! Delegate the rendering to the [`i_slint_renderer_software::SoftwareRenderer`]
+//! Module containing the software renderer
 
-use i_slint_core::api::PhysicalSize as PhysicalWindowSize;
 use i_slint_core::platform::PlatformError;
 use i_slint_core::renderer::DrawOutcome;
 pub use i_slint_renderer_software::SoftwareRenderer;
@@ -16,8 +15,8 @@ pub struct SoftwareRendererAdapter {
     renderer: SoftwareRenderer,
     /// fd-bound display stack; rebuilt on lease re-grant (the SoftwareRenderer
     /// itself is fd-independent and survives a rebuild).
-    display: std::cell::RefCell<Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>>,
-    presenter: std::cell::RefCell<Arc<dyn crate::display::Presenter>>,
+    display: std::cell::RefCell<Option<Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>>>,
+    presenter: std::cell::RefCell<Option<Arc<dyn crate::display::Presenter>>>,
     size: std::cell::Cell<i_slint_core::api::PhysicalSize>,
 }
 
@@ -186,10 +185,16 @@ impl SoftwareRendererAdapter {
         let (width, height) = display.size();
         let size = i_slint_core::api::PhysicalSize::new(width, height);
 
-        *self.display.borrow_mut() = display.clone();
-        *self.presenter.borrow_mut() = display.as_presenter();
+        *self.display.borrow_mut() = Some(display.clone());
+        *self.presenter.borrow_mut() = Some(display.as_presenter());
         self.size.set(size);
         Ok(())
+    }
+
+    fn current_display(
+        &self,
+    ) -> std::cell::Ref<'_, Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>> {
+        std::cell::Ref::map(self.display.borrow(), |d| d.as_ref().expect("display initialized"))
     }
 }
 
@@ -204,7 +209,7 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
         _draw_mouse_cursor_callback: &dyn Fn(&mut dyn i_slint_core::item_rendering::ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError> {
         let size = self.size.get();
-        self.display.borrow().map_back_buffer(&mut |pixels, age, format| {
+        self.current_display().map_back_buffer(&mut |pixels, age, format| {
             self.renderer.set_repaint_buffer_type(match age {
                 1 => RepaintBufferType::ReusedBuffer,
                 2 => RepaintBufferType::SwappedBuffers,
@@ -251,7 +256,11 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
 
             Ok(())
         })?;
-        self.presenter.borrow().present()?;
+        self.presenter
+            .borrow()
+            .as_ref()
+            .expect("presenter initialized")
+            .present()?;
         Ok(DrawOutcome::Success)
     }
 

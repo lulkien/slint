@@ -3,14 +3,22 @@
 
 # cSpell: ignore memmap xkbcommon sgc
 #
-# sgc fork of the linuxkms backend (WIP, sgc-lease branch): copy of
-# i-slint-backend-linuxkms with sgc-specific changes (injected DRM lease fd via
-# BackendBuilder::with_drm_device). Keep the upstream linuxkms crate pristine so
-# syncing with the original repo stays conflict-free; do NOT port changes back
-# into i-slint-backend-linuxkms.
+# sgc fork of the linuxkms backend (WIP, sgc-lease-1.17): copy of the 1.17
+# release branch's i-slint-backend-linuxkms, trimmed to Linux and to the
+# renderers we use (software + femtovg GL), with sgc-specific changes:
+#   - BackendBuilder::with_drm_device: render on an injected DRM (lease) fd
+#   - revoke/regrant survival (renderer rebuild, suspend, event-loop hooks)
+#   - fontique fontconfig-dlopen baked in (no libfontconfig link-time dep,
+#     keeps fully static musl builds possible)
+#   - input handling (libinput) is OPT-IN here (upstream 1.17 had it
+#     unconditional, dragging libudev into every build); enable `libinput` when
+#     input support is needed. No libseat anywhere: this backend renders on an
+#     sgc lease (or runs as root) and opens /dev/input directly.
+# Keep the upstream linuxkms crate pristine so syncing stays conflict-free; do
+# NOT port changes back into i-slint-backend-linuxkms.
 [package]
 name = "i-slint-backend-linuxsgc"
-description = "slint DRM/KMS backend (sgc fork): render on an injected DRM lease fd"
+description = "slint DRM/KMS backend (sgc fork, Linux): render on an injected DRM lease fd"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -19,31 +27,19 @@ repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
-build = "build.rs"
-
 [lib]
 path = "lib.rs"
 
 [features]
-renderer-skia = ["renderer-skia-opengl"]
-renderer-skia-vulkan = ["unstable-wgpu-30", "i-slint-renderer-skia/vulkan"]
-unstable-wgpu-29 = ["i-slint-renderer-skia/wgpu-29", "drm", "dep:memmap2"]
-unstable-wgpu-30 = ["i-slint-renderer-skia/wgpu-30", "drm", "dep:memmap2", "dep:wgpu-30"]
-renderer-skia-opengl = ["i-slint-renderer-skia/opengl", "drm", "gbm", "glutin", "raw-window-handle", "dep:memmap2"]
+# Render on the DRM device with OpenGL via gbm/EGL (needs the GPU mesa stack).
 renderer-femtovg = ["i-slint-renderer-femtovg/opengl", "drm", "gbm", "glutin", "raw-window-handle"]
-renderer-femtovg-wgpu = ["i-slint-renderer-femtovg/wgpu", "drm", "dep:wgpu-30"]
+# CPU rendering into dumb buffers / fbdev — the only renderer that builds fully
+# static musl (no gbm/EGL linkage).
 renderer-software = ["i-slint-renderer-software/std", "drm", "dep:bytemuck", "dep:memmap2"]
-renderer-vello = [
-  "dep:i-slint-renderer-anyrender",
-  "i-slint-renderer-anyrender/vello",
-  "i-slint-core/unstable-wgpu-29",
-  "drm",
-  "dep:memmap2",
-]
-libseat = ["dep:libseat"]
 ## Handle mouse, touch and keyboard input via libinput. Without this feature the
 ## backend renders but receives no input events (and libinput, libudev and
-## libxkbcommon are not needed at build or run time).
+## libxkbcommon are not needed at build or run time). No libseat: we run as root
+## (or render on an sgc lease fd), so libinput opens /dev/input directly.
 libinput = ["dep:input", "dep:xkbcommon"]
 
 default = []
@@ -51,27 +47,19 @@ default = []
 [dependencies]
 i-slint-core = { workspace = true, features = ["default", "image-decoders", "svg"] }
 i-slint-common = { workspace = true, features = ["default"] }
-i-slint-renderer-skia = { workspace = true, features = ["default", "kms"], optional = true }
-i-slint-renderer-anyrender = { workspace = true, optional = true }
 i-slint-renderer-femtovg = { workspace = true, features = ["default"], optional = true }
 i-slint-renderer-software = { workspace = true, optional = true }
-# Direct dependency only to enable wgpu's `drm` feature, which gates
-# `SurfaceTargetUnsafe::Drm` as of wgpu 30; the code uses the re-export
-# through i-slint-core.
-wgpu-30 = { workspace = true, optional = true, features = ["drm"] }
-# sgc: fontique depends on yeslogic-fontconfig-sys, which pkg-config-links
-# libfontconfig on Linux — impossible for fully static musl builds. Flip the
-# crate's `fontconfig-dlopen` feature (unified across the whole dependency
-# graph) so fontconfig is dlopened at runtime instead of linked. Runtime still
-# needs libfontconfig.so.1, or fonts registered directly (see the demo).
-fontique = { workspace = true, features = ["fontconfig-dlopen"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input = { workspace = true, default-features = true, optional = true }
 xkbcommon = { version = "0.9.0", optional = true }
 calloop = { version = "0.14.1" }
-libseat = { version = "0.2.1", optional = true, default-features = false }
 nix = { version = "0.31.0", features = ["fs", "ioctl"] }
+# sgc: fontique depends on yeslogic-fontconfig-sys, which pkg-config-links
+# libfontconfig on Linux — impossible for fully static musl builds. Flip the
+# crate's `fontconfig-dlopen` feature (unified across the whole dependency
+# graph) so fontconfig is dlopened at runtime instead of linked.
+fontique = { workspace = true, features = ["fontconfig-dlopen"] }
 # Keep in sync with the drm version used by gbm
 drm = { version = "0.14.0", optional = true }
 gbm = { version = "0.18.0", optional = true, default-features = false, features = ["drm-support"] }

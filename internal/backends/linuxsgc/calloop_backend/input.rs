@@ -5,14 +5,8 @@
 //! This module contains the code to receive input events from libinput
 
 use std::cell::RefCell;
-#[cfg(feature = "libseat")]
-use std::collections::HashMap;
-#[cfg(not(feature = "libseat"))]
 use std::fs::{File, OpenOptions};
 use std::os::fd::OwnedFd;
-#[cfg(feature = "libseat")]
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, RawFd};
-#[cfg(not(feature = "libseat"))]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -20,8 +14,8 @@ use std::rc::Rc;
 
 use i_slint_core::api::LogicalPosition;
 use i_slint_core::lengths::logical_point_from_api;
-use i_slint_core::platform::{InternalEvent, PlatformError, PointerEventButton, WindowEvent};
-use i_slint_core::window::WindowAdapter;
+use i_slint_core::platform::{PlatformError, PointerEventButton, WindowEvent};
+use i_slint_core::window::{WindowAdapter, WindowInner};
 use i_slint_core::{Property, SharedString};
 use input::LibinputInterface;
 use input::event::keyboard::{KeyState, KeyboardEventTrait};
@@ -30,59 +24,8 @@ use xkbcommon::*;
 
 use crate::fullscreenwindowadapter::FullscreenWindowAdapter;
 
-#[cfg(feature = "libseat")]
-struct SeatWrap {
-    seat: Rc<RefCell<libseat::Seat>>,
-    device_for_fd: HashMap<RawFd, libseat::Device>,
-}
-
-#[cfg(feature = "libseat")]
-impl SeatWrap {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new(seat: &Rc<RefCell<libseat::Seat>>) -> input::Libinput {
-        let seat_name = seat.borrow_mut().name().to_string();
-        let mut libinput = input::Libinput::new_with_udev(Self {
-            seat: seat.clone(),
-            device_for_fd: Default::default(),
-        });
-        libinput.udev_assign_seat(&seat_name).unwrap();
-        libinput
-    }
-}
-
-#[cfg(feature = "libseat")]
-impl LibinputInterface for SeatWrap {
-    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        self.seat
-            .borrow_mut()
-            .open_device(&path)
-            .map(|device| {
-                let flags = nix::fcntl::OFlag::from_bits_retain(flags);
-                let fd = device.as_fd();
-                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags))
-                    .map_err(|e| format!("Error applying libinput provided open fd flags: {e}"))
-                    .unwrap();
-
-                let raw_fd = fd.as_raw_fd();
-                self.device_for_fd.insert(raw_fd, device);
-                // Safety: API requires us to own it, but in close_restricted() we'll take it back.
-                unsafe { OwnedFd::from_raw_fd(raw_fd) }
-            })
-            .map_err(|e| e.0)
-    }
-    fn close_restricted(&mut self, fd: OwnedFd) {
-        // Transfer ownership back to libseat
-        let fd = fd.into_raw_fd();
-        if let Some(device_id) = self.device_for_fd.remove(&fd) {
-            let _ = self.seat.borrow_mut().close_device(device_id);
-        }
-    }
-}
-
-#[cfg(not(feature = "libseat"))]
 struct DirectDeviceAccess {}
 
-#[cfg(not(feature = "libseat"))]
 impl DirectDeviceAccess {
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> input::Libinput {
@@ -92,7 +35,6 @@ impl DirectDeviceAccess {
     }
 }
 
-#[cfg(not(feature = "libseat"))]
 impl LibinputInterface for DirectDeviceAccess {
     fn open_restricted(&mut self, path: &Path, flags_raw: i32) -> Result<OwnedFd, i32> {
         let flags = nix::fcntl::OFlag::from_bits_retain(flags_raw);
@@ -134,12 +76,8 @@ impl<'a> LibInputHandler<'a> {
     pub fn init<T>(
         window: &'a RefCell<Option<Rc<FullscreenWindowAdapter>>>,
         event_loop_handle: &calloop::LoopHandle<'a, T>,
-        #[cfg(feature = "libseat")] seat: &'a Rc<RefCell<libseat::Seat>>,
         libinput_event_hook: &'a Option<Box<dyn Fn(&::input::Event) -> bool>>,
     ) -> Result<Pin<Rc<Property<Option<LogicalPosition>>>>, PlatformError> {
-        #[cfg(feature = "libseat")]
-        let libinput = SeatWrap::new(seat);
-        #[cfg(not(feature = "libseat"))]
         let libinput = DirectDeviceAccess::new();
 
         let mouse_pos_property = Rc::pin(Property::new(None));
@@ -231,7 +169,7 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                                 .clamp(0., screen_size.height);
                             self.mouse_pos.set(Some(mouse_pos));
                             let event = WindowEvent::PointerMoved { position: mouse_pos };
-                            window.dispatch_event_with_result(event).map_err(Self::Error::other)?;
+                            window.try_dispatch_event(event).map_err(Self::Error::other)?;
                         }
                         input::event::PointerEvent::MotionAbsolute(abs_motion_event) => {
                             let mouse_pos = LogicalPosition {
@@ -243,7 +181,7 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                             };
                             self.mouse_pos.set(Some(mouse_pos));
                             let event = WindowEvent::PointerMoved { position: mouse_pos };
-                            window.dispatch_event_with_result(event).map_err(Self::Error::other)?;
+                            window.try_dispatch_event(event).map_err(Self::Error::other)?;
                         }
                         input::event::PointerEvent::Button(button_event) => {
                             // https://github.com/torvalds/linux/blob/0dd2a6fb1e34d6dcb96806bc6b111388ad324722/include/uapi/linux/input-event-codes.h#L355
@@ -264,7 +202,7 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                                     WindowEvent::PointerReleased { position: mouse_pos, button }
                                 }
                             };
-                            window.dispatch_event_with_result(event).map_err(Self::Error::other)?;
+                            window.try_dispatch_event(event).map_err(Self::Error::other)?;
                         }
                         _ => {}
                     }
@@ -277,20 +215,20 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                         );
                         let slot = touch_down_event.slot().unwrap_or(0) as i32;
                         set_touch_pos(&mut self.last_touch_positions, slot, pos);
-                        window.dispatch_event(WindowEvent::internal(InternalEvent::Touch {
-                            id: slot,
-                            position: logical_point_from_api(pos),
-                            phase: i_slint_core::input::TouchPhase::Started,
-                        }));
+                        WindowInner::from_pub(window).process_touch_input(
+                            slot,
+                            logical_point_from_api(pos),
+                            i_slint_core::input::TouchPhase::Started,
+                        );
                     }
                     input::event::TouchEvent::Up(touch_up_event) => {
                         let slot = touch_up_event.slot().unwrap_or(0) as i32;
                         let pos = take_touch_pos(&mut self.last_touch_positions, slot);
-                        window.dispatch_event(WindowEvent::internal(InternalEvent::Touch {
-                            id: slot,
-                            position: logical_point_from_api(pos),
-                            phase: i_slint_core::input::TouchPhase::Ended,
-                        }));
+                        WindowInner::from_pub(window).process_touch_input(
+                            slot,
+                            logical_point_from_api(pos),
+                            i_slint_core::input::TouchPhase::Ended,
+                        );
                     }
                     input::event::TouchEvent::Motion(touch_motion_event) => {
                         let pos = LogicalPosition::new(
@@ -299,20 +237,20 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                         );
                         let slot = touch_motion_event.slot().unwrap_or(0) as i32;
                         set_touch_pos(&mut self.last_touch_positions, slot, pos);
-                        window.dispatch_event(WindowEvent::internal(InternalEvent::Touch {
-                            id: slot,
-                            position: logical_point_from_api(pos),
-                            phase: i_slint_core::input::TouchPhase::Moved,
-                        }));
+                        WindowInner::from_pub(window).process_touch_input(
+                            slot,
+                            logical_point_from_api(pos),
+                            i_slint_core::input::TouchPhase::Moved,
+                        );
                     }
                     input::event::TouchEvent::Cancel(touch_cancel_event) => {
                         let slot = touch_cancel_event.slot().unwrap_or(0) as i32;
                         let pos = take_touch_pos(&mut self.last_touch_positions, slot);
-                        window.dispatch_event(WindowEvent::internal(InternalEvent::Touch {
-                            id: slot,
-                            position: logical_point_from_api(pos),
-                            phase: i_slint_core::input::TouchPhase::Cancelled,
-                        }));
+                        WindowInner::from_pub(window).process_touch_input(
+                            slot,
+                            logical_point_from_api(pos),
+                            i_slint_core::input::TouchPhase::Cancelled,
+                        );
                     }
                     _ => {}
                 },
@@ -369,7 +307,7 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                             KeyState::Pressed => WindowEvent::KeyPressed { text },
                             KeyState::Released => WindowEvent::KeyReleased { text },
                         };
-                        window.dispatch_event_with_result(event).map_err(Self::Error::other)?;
+                        window.try_dispatch_event(event).map_err(Self::Error::other)?;
                     }
                 }
                 _ => {}
