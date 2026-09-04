@@ -62,13 +62,16 @@ impl GbmDisplay {
     }
 
     pub fn filter_gl_config(&self, config: &glutin::config::Config) -> bool {
-        // glutin is compiled with only the EGL backend (features "egl",
-        // "libloading"), so Config is exactly the Egl variant here.
+        // Only EGL-backed gbm surfaces are supported. When glutin is built
+        // EGL-only (the linuxsgc femtovg feature) the Glx arm below is
+        // unreachable; when built wider (via the backend selector) it is not.
+        #[allow(unreachable_patterns)]
         match &config {
             glutin::config::Config::Egl(egl_config) => {
                 drm::buffer::DrmFourcc::try_from(egl_config.native_visual())
                     == Ok(self.surface_format)
             }
+            _ => false,
         }
     }
 }

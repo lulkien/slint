@@ -273,7 +273,8 @@ impl BackendSelector {
         #[cfg(any(
             feature = "i-slint-backend-qt",
             feature = "i-slint-backend-winit",
-            feature = "i-slint-backend-linuxkms"
+            feature = "i-slint-backend-linuxkms",
+            feature = "i-slint-backend-linuxsgc"
         ))]
         if (self.backend.is_none() || self.renderer.is_none())
             && let Ok(backend_config) = std::env::var("SLINT_BACKEND")
@@ -350,6 +351,20 @@ impl BackendSelector {
                 #[cfg(all(target_os = "linux", feature = "unstable-libinput-09"))]
                 if let Some(event_hook) = self.libinput_event_hook.take() {
                     builder = builder.with_libinput_event_hook(event_hook);
+                }
+
+                Box::new(builder.build()?)
+            }
+            #[cfg(all(feature = "i-slint-backend-linuxsgc", target_os = "linux"))]
+            "linuxsgc" => {
+                let mut builder = i_slint_backend_linuxsgc::BackendBuilder::default();
+
+                if let Some(api) = self.requested_graphics_api.take() {
+                    builder = builder.request_graphics_api(api);
+                }
+
+                if let Some(renderer_name) = self.renderer.as_ref() {
+                    builder = builder.with_renderer_name(renderer_name.into());
                 }
 
                 Box::new(builder.build()?)

@@ -136,6 +136,7 @@ version = "1.17.1"
 [workspace.dependencies]
 i-slint-backend-android-activity = { version = "=1.17.1", path = "internal/backends/android-activity", default-features = false }
 i-slint-backend-linuxkms = { version = "=1.17.1", path = "internal/backends/linuxkms", default-features = false }
+i-slint-backend-linuxsgc = { version = "=1.17.1", path = "internal/backends/linuxsgc", default-features = false }
 i-slint-backend-qt = { version = "=1.17.1", path = "internal/backends/qt", default-features = false }
 i-slint-backend-selector = { version = "=1.17.1", path = "internal/backends/selector", default-features = false }
 i-slint-backend-testing = { version = "=1.17.1", path = "internal/backends/testing", default-features = false }

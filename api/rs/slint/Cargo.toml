@@ -214,6 +214,13 @@ backend-linuxkms = ["i-slint-backend-selector/backend-linuxkms", "std"]
 ## windowing system.
 backend-linuxkms-noseat = ["i-slint-backend-selector/backend-linuxkms-noseat", "std"]
 
+## sgc fork: fullscreen UI on a DRM lease granted by the simple-graphics-controller
+## daemon (@sgc). The backend owns the whole session (connect, acquire,
+## revoke/re-grant survival) — the app just enables this feature (plus
+## `renderer-software` or `renderer-femtovg`) and runs; select with
+## `SLINT_BACKEND=linuxsgc` or by enabling no other backend.
+backend-linuxsgc = ["i-slint-backend-selector/backend-linuxsgc", "std"]
+
 ## Use the backend based on the [android-activity](https://docs.rs/android-activity) crate. (Using it's native activity feature)
 backend-android-activity-06 = [
   "i-slint-backend-android-activity/native-activity",

@@ -7,7 +7,8 @@
     not(any(
         feature = "i-slint-backend-qt",
         feature = "i-slint-backend-winit",
-        feature = "i-slint-backend-linuxkms"
+        feature = "i-slint-backend-linuxkms",
+        feature = "i-slint-backend-linuxsgc"
     )),
     no_std
 )]
@@ -35,6 +36,11 @@ fn create_linuxkms_backend() -> Result<Box<dyn Platform + 'static>, PlatformErro
     Ok(Box::new(i_slint_backend_linuxkms::BackendBuilder::default().build()?))
 }
 
+#[cfg(all(feature = "i-slint-backend-linuxsgc", target_os = "linux"))]
+fn create_linuxsgc_backend() -> Result<Box<dyn Platform + 'static>, PlatformError> {
+    Ok(Box::new(i_slint_backend_linuxsgc::BackendBuilder::default().build()?))
+}
+
 #[cfg(all(feature = "mcp", supports_headless))]
 fn create_headless_backend(renderer: &str) -> Result<Box<dyn Platform + 'static>, PlatformError> {
     Ok(Box::new(i_slint_backend_testing::TestingBackend::new(
@@ -58,6 +64,9 @@ cfg_if::cfg_if! {
     } else if #[cfg(all(feature = "i-slint-backend-linuxkms", target_os = "linux"))] {
         use i_slint_backend_linuxkms as default_backend;
         const DEFAULT_BACKEND_NAME: &str = "linuxkms";
+    } else if #[cfg(all(feature = "i-slint-backend-linuxsgc", target_os = "linux"))] {
+        use i_slint_backend_linuxsgc as default_backend;
+        const DEFAULT_BACKEND_NAME: &str = "linuxsgc";
     } else {
         const DEFAULT_BACKEND_NAME: &str = "";
     }
@@ -67,7 +76,8 @@ cfg_if::cfg_if! {
     if #[cfg(all(not(target_os = "android"), any(
             all(feature = "i-slint-backend-qt", not(no_qt)),
             feature = "i-slint-backend-winit",
-            all(feature = "i-slint-backend-linuxkms", target_os = "linux")
+            all(feature = "i-slint-backend-linuxkms", target_os = "linux"),
+            all(feature = "i-slint-backend-linuxsgc", target_os = "linux")
         )))] {
         fn create_default_backend() -> Result<Box<dyn Platform + 'static>, PlatformError> {
             use alloc::borrow::Cow;
@@ -79,6 +89,8 @@ cfg_if::cfg_if! {
                 ("Winit", create_winit_backend as fn() -> Result<Box<(dyn Platform + 'static)>, PlatformError>),
                 #[cfg(all(feature = "i-slint-backend-linuxkms", target_os = "linux"))]
                 ("LinuxKMS", create_linuxkms_backend as fn() -> Result<Box<(dyn Platform + 'static)>, PlatformError>),
+                #[cfg(all(feature = "i-slint-backend-linuxsgc", target_os = "linux"))]
+                ("LinuxSGC", create_linuxsgc_backend as fn() -> Result<Box<(dyn Platform + 'static)>, PlatformError>),
                 // Last-resort headless fallback so the MCP server keeps
                 // working when no display is available.
                 #[cfg(all(feature = "mcp", supports_headless))]
@@ -123,6 +135,14 @@ cfg_if::cfg_if! {
                     }
                     return builder.build().map(|b| Box::new(b) as Box<dyn Platform + 'static>)
                 },
+                #[cfg(all(feature = "i-slint-backend-linuxsgc", target_os = "linux"))]
+                "linuxsgc" => {
+                    let mut builder = i_slint_backend_linuxsgc::BackendBuilder::default();
+                    if !_renderer.is_empty() {
+                        builder = builder.with_renderer_name(_renderer.into());
+                    }
+                    return builder.build().map(|b| Box::new(b) as Box<dyn Platform + 'static>)
+                },
                 #[cfg(feature = "backend-testing")]
                 "testing" => return Ok(Box::new(i_slint_backend_testing::TestingBackend::new(
                     i_slint_backend_testing::TestingBackendOptions { mock_time: false, threading: true, ..Default::default() },
@@ -159,6 +179,7 @@ pub fn parse_backend_env_var(backend_config: &str) -> (&str, &str) {
         "skia" => ("winit", "skia"),
         "sw" | "software" => ("winit", "software"),
         "linuxkms" => ("linuxkms", ""),
+        "linuxsgc" => ("linuxsgc", ""),
         x => (x, ""),
     })
 }
