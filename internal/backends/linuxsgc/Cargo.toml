@@ -54,9 +54,9 @@ i-slint-common = { workspace = true, features = ["default"] }
 i-slint-renderer-femtovg = { workspace = true, features = ["default"], optional = true }
 i-slint-renderer-software = { workspace = true, optional = true }
 # sgc: the backend drives its own session against the simple-graphics-controller
-# daemon (connect @sgc, acquire the card lease, pump revoke/re-grant). Path dep
-# during development; move to a git dep once libsgc-rs gets its own repo.
-libsgc-rs = { path = "../../../../simple-graphics-controller/libsgc-rs" }
+# daemon (connect @sgc, acquire the card lease, pump revoke/re-grant). The
+# client library lives in its own repo and is fetched as a git ref.
+libsgc-rs = { git = "https://github.com/lulkien/libsgc-rs.git" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input = { workspace = true, default-features = true, optional = true }

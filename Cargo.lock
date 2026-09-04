@@ -6513,6 +6513,7 @@ dependencies = [
 [[package]]
 name = "libsgc-rs"
 version = "0.1.0"
+source = "git+https://github.com/lulkien/libsgc-rs.git#9dc9bb79d76cec06c39f6157a34a6a7bec39eb89"
 dependencies = [
  "libc",
  "sendfd",
@@ -10420,6 +10421,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 [[package]]
 name = "simple-graphics-protocol"
 version = "0.1.0"
+source = "git+https://github.com/lulkien/simple-graphics-protocol.git#cd67a6b028a0cb43a53f8a943db1ec3dc0e33efd"
 dependencies = [
  "nix 0.29.0",
  "rmp-serde",
