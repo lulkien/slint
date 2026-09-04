@@ -3,26 +3,32 @@
 
 // cSpell: ignore CLOEXEC GETFL NOCTTY NONBLOCK sgc
 // sgc fork of the linuxkms calloop backend, trimmed to Linux, no libseat, no
-// libinput (headless lease clients). Upstream's seat/input handling is gone;
-// the device is either the injected DRM (lease) fd or opened directly.
+// libinput-by-default (headless lease clients). The display is ALWAYS the DRM
+// lease the backend acquired from the @sgc daemon: `Backend::build` connects
+// and acquires (sgc or die — no direct /dev/dri open, no fbdev fallback), and
+// the event loop pumps the session. A revoke suspends rendering until the
+// lease is re-granted, on which the display stack is rebuilt on the fresh fd.
 
 use std::cell::{Cell, RefCell};
-use std::fs::OpenOptions;
-use std::os::fd::OwnedFd;
-use std::os::fd::AsFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::rc::Rc;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use calloop::EventLoop;
 use i_slint_core::platform::PlatformError;
+use libsgc_rs::SgcEvent;
 
-use crate::BackendBuilder;
 use crate::fullscreenwindowadapter::FullscreenWindowAdapter;
+use crate::sgc::SgcSession;
 
 #[cfg(feature = "libinput")]
 mod input;
+
+/// How often the sgc socket is pumped (non-blocking poll). Far inside the
+/// daemon's 5s revoke/ack grace period; cheap enough to run always.
+const SGC_PUMP_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Clone)]
 struct Proxy {
@@ -65,23 +71,117 @@ impl i_slint_core::platform::EventLoopProxy for Proxy {
     }
 }
 
-type EventLoopHook =
-    Box<dyn for<'a> FnOnce(&calloop::LoopHandle<'a, LoopData>) -> Result<(), PlatformError>>;
-
-pub struct Backend {
+/// Everything the event loop and the window adapter share. All of it lives
+/// behind an `Rc` so the sgc pump (a calloop source with 'static captures)
+/// can drive suspend/rebuild without owning the `Backend`.
+struct SharedState {
     window: RefCell<Option<Rc<FullscreenWindowAdapter>>>,
-    user_event_receiver: RefCell<Option<calloop::channel::Channel<Box<dyn FnOnce() + Send>>>>,
-    proxy: Proxy,
-    /// sgc fork: the injected DRM (lease) fd, in a shared slot so it can be
-    /// swapped when a revoked lease is re-granted (see `set_drm_fd`).
-    drm_fd: Rc<RefCell<Option<(u8, Rc<OwnedFd>)>>>,
-    /// While set, the window adapter skips rendering (revoked lease pending
+    /// The current lease fd (a dup, Rc'd): seeded at `build` from the
+    /// acquire, swapped on re-grant, cleared on revoke. The renderer display
+    /// stack is (re)built on whatever is in here.
+    drm_fd: Rc<RefCell<Option<Rc<OwnedFd>>>>,
+    /// Card index of the lease; the only `/dev/dri/cardN` path the backend
+    /// will ever open.
+    card: u8,
+    /// While set, the window adapter skips rendering (lease revoked, pending
     /// re-grant). Shared with the adapter.
     suspended: Rc<Cell<bool>>,
-    /// sgc fork: sources the app wants registered in the backend's event loop
-    /// (e.g. a poll source on the resource-controller socket). Run once, at
-    /// the top of `run_event_loop`.
-    event_loop_hooks: RefCell<Vec<EventLoopHook>>,
+}
+
+/// Device opener that hands out the current sgc lease fd and refuses anything
+/// else: rendering happens on the granted device and on nothing else.
+/// Rebuilt on every call so a swapped fd (re-grant) is picked up by the next
+/// renderer/display-stack init.
+impl SharedState {
+    fn device_accessor(&self) -> Box<crate::DeviceOpener<'static>> {
+        let card_name = format!("card{}", self.card);
+        let drm_fd = self.drm_fd.clone();
+        Box::new(move |device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
+            if device.file_name().and_then(|name| name.to_str()) != Some(card_name.as_str()) {
+                return Err(format!(
+                    "Refusing to open {}: rendering only on the sgc lease fd for {}",
+                    device.display(),
+                    card_name
+                )
+                .into());
+            }
+            let fd = drm_fd.borrow().clone().ok_or_else(|| {
+                PlatformError::Other(format!(
+                    "No lease fd held for {} (revoked?): nothing to render on",
+                    device.display()
+                ))
+            })?;
+            // For polling for drm::control::Event::PageFlip we need a blocking
+            // FD. The fd came over SCM_RIGHTS, sharing its open file
+            // description with the daemon's copy — this clears O_NONBLOCK on
+            // the shared description; the daemon must not rely on it.
+            let fd_borrowed = fd.as_fd();
+            let flags = nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_GETFL)
+                .map_err(|e| format!("Error getting file descriptor flags: {e}"))?;
+            let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
+            flags.remove(nix::fcntl::OFlag::O_NONBLOCK);
+            nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_SETFL(flags))
+                .map_err(|e| format!("Error making device fd blocking: {e}"))?;
+            Ok(fd)
+        })
+    }
+
+    /// Apply one sgc event to the render state.
+    fn on_sgc_event(&self, event: SgcEvent) -> Result<(), PlatformError> {
+        match event {
+            SgcEvent::Revoked { resource } => {
+                // The library already sent the Release revoke-ack; the daemon
+                // requeues us. Drop the fd slot and stop rendering: the old
+                // display stack died with the lease and must not be touched.
+                println!("linuxsgc: lease {resource:?} revoked — suspending until re-granted");
+                self.suspended.set(true);
+                *self.drm_fd.borrow_mut() = None;
+            }
+            SgcEvent::Granted { resource, fd } => {
+                println!(
+                    "linuxsgc: lease {resource:?} re-granted (fd {}) — rebuilding display stack",
+                    fd.as_raw_fd()
+                );
+                *self.drm_fd.borrow_mut() = Some(Rc::new(fd));
+                if let Some(adapter) = self.window.borrow().clone() {
+                    let accessor = self.device_accessor();
+                    // Software renderer: rebuilds its whole display stack on
+                    // the fresh fd. The GL renderer cannot be rebuilt
+                    // in-process (its EGL/GL context dies with the lease fd),
+                    // so this errors and the error ends the event loop —
+                    // documented limitation of the femtovg flavor.
+                    adapter.rebuild_renderer(&accessor)?;
+                }
+                self.suspended.set(false);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Drain the sgc socket: handle every event the daemon has queued.
+/// `Err` = the connection is over (daemon died/restarted) — the lease died
+/// with it; the caller must stop.
+fn pump_sgc(shared: &SharedState, session: &SgcSession) -> Result<(), PlatformError> {
+    loop {
+        match session.pump()? {
+            Some(event) => shared.on_sgc_event(event)?,
+            None => return Ok(()),
+        }
+    }
+}
+
+pub struct Backend {
+    shared: Rc<SharedState>,
+    /// The sgc session (client + acquired lease). Owned for the backend's
+    /// lifetime; dropped with it, which closes the socket and lets the daemon
+    /// reclaim the card.
+    sgc_session: Rc<SgcSession>,
+    user_event_receiver: RefCell<Option<calloop::channel::Channel<Box<dyn FnOnce() + Send>>>>,
+    proxy: Proxy,
+    /// Fatal error stashed by the sgc pump (session lost, rebuild failed);
+    /// ends the event loop with an error instead of Ok.
+    fatal: Rc<RefCell<Option<PlatformError>>>,
     renderer_factory:
         fn(
             &crate::DeviceOpener,
@@ -96,7 +196,7 @@ pub struct Backend {
 }
 
 impl Backend {
-    pub fn build(builder: BackendBuilder) -> Result<Self, PlatformError> {
+    pub fn build(builder: crate::BackendBuilder) -> Result<Self, PlatformError> {
         let (user_event_sender, user_event_receiver) = calloop::channel::channel();
 
         let renderer_factory = match builder.renderer_name.as_deref() {
@@ -114,13 +214,23 @@ impl Backend {
             }
         };
 
+        // sgc or die: connect to the daemon and acquire the lease now, so a
+        // missing/denying daemon fails the app at startup with a clear error.
+        let session = SgcSession::connect_and_acquire()?;
+        let card = session.card;
+        let fd = Rc::new(session.fd()?);
+
         Ok(Backend {
-            window: Default::default(),
+            shared: Rc::new(SharedState {
+                window: RefCell::new(None),
+                drm_fd: Rc::new(RefCell::new(Some(fd))),
+                card,
+                suspended: Rc::new(Cell::new(false)),
+            }),
+            sgc_session: Rc::new(session),
             user_event_receiver: RefCell::new(Some(user_event_receiver)),
             proxy: Proxy::new(user_event_sender),
-            drm_fd: Rc::new(RefCell::new(builder.drm_fd)),
-            suspended: Rc::new(Cell::new(false)),
-            event_loop_hooks: RefCell::new(Vec::new()),
+            fatal: Rc::new(RefCell::new(None)),
             renderer_factory,
             requested_graphics_api: builder.requested_graphics_api,
             sel_clipboard: Default::default(),
@@ -131,97 +241,10 @@ impl Backend {
     }
 }
 
-// sgc fork: device opener that renders on the currently injected DRM (lease)
-// fd (or opens the device directly when none is injected), plus the
-// revoke/regrant API. The opener is rebuilt on every call so a swapped fd
-// (re-grant) is picked up by the next renderer rebuild.
-impl Backend {
-    fn device_accessor(&self) -> Box<crate::DeviceOpener<'static>> {
-        if let Some((card_index, fd)) = self.drm_fd.borrow().as_ref() {
-            let card_index = *card_index;
-            let card_name = format!("card{card_index}");
-            let fd = fd.clone();
-            return Box::new(
-                move |device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
-                    if device.file_name().and_then(|name| name.to_str())
-                        != Some(card_name.as_str())
-                    {
-                        return Err(format!(
-                            "Refusing to open {}: rendering on the injected DRM fd for card{}",
-                            device.display(),
-                            card_index
-                        )
-                        .into());
-                    }
-                    // For polling for drm::control::Event::PageFlip we need a
-                    // blocking FD. The fd is a dup of the injector's — this
-                    // clears O_NONBLOCK on the shared open file description; the
-                    // injector must not rely on it.
-                    let fd_borrowed = fd.as_fd();
-                    let flags = nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_GETFL)
-                        .map_err(|e| format!("Error getting file descriptor flags: {e}"))?;
-                    let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
-                    flags.remove(nix::fcntl::OFlag::O_NONBLOCK);
-                    nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_SETFL(flags))
-                        .map_err(|e| format!("Error making device fd blocking: {e}"))?;
-                    Ok(fd.clone())
-                },
-            );
-        }
-
-        Box::new(|device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
-            let device = OpenOptions::new()
-                .custom_flags((nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC).bits())
-                .read(true)
-                .write(true)
-                .open(device)
-                .map(|file| file.into())
-                .map_err(|e| format!("Error opening device {}: {e}", device.display()))?;
-
-            Ok(Rc::new(device))
-        })
-    }
-
-    /// sgc fork: swap the injected DRM fd for a fresh one (a re-granted lease
-    /// after a revoke). Call [`Self::rebuild_renderer`] afterwards; rendering
-    /// must be suspended (`set_suspended(true)`) in between.
-    pub fn set_drm_fd(&self, card_index: u8, fd: OwnedFd) {
-        *self.drm_fd.borrow_mut() = Some((card_index, Rc::new(fd)));
-    }
-
-    /// sgc fork: while suspended the window adapter renders nothing (a revoked
-    /// lease fd must not be touched until it is re-granted and rebuilt).
-    pub fn set_suspended(&self, suspended: bool) {
-        self.suspended.set(suspended);
-    }
-
-    /// sgc fork: rebuild the window adapter's display stack on the CURRENT
-    /// injected fd (call after `set_drm_fd` with a re-granted lease). Must run
-    /// on the event-loop thread.
-    pub fn rebuild_renderer(&self) -> Result<(), PlatformError> {
-        let accessor = self.device_accessor();
-        let Some(adapter) = self.window.borrow().clone() else {
-            return Err(PlatformError::Other(
-                "rebuild_renderer: no window adapter yet".into(),
-            ));
-        };
-        adapter.rebuild_renderer(&accessor)
-    }
-
-    /// sgc fork: register a hook that runs once at the top of `run_event_loop`,
-    /// with the loop handle — for inserting extra event sources (e.g. a poll
-    /// source driving the resource-controller client).
-    pub fn add_event_loop_hook(&self, hook: EventLoopHook) {
-        self.event_loop_hooks.borrow_mut().push(hook);
-    }
-}
-
 impl i_slint_core::platform::Platform for Backend {
     fn create_window_adapter(
         &self,
     ) -> Result<std::rc::Rc<dyn i_slint_core::window::WindowAdapter>, PlatformError> {
-        let device_accessor = self.device_accessor();
-
         // This could be per-screen, once we support multiple outputs
         let rotation =
             std::env::var("SLINT_KMS_ROTATION").map_or(Ok(Default::default()), |rot_str| {
@@ -231,31 +254,35 @@ impl i_slint_core::platform::Platform for Backend {
                     .map_err(|e| format!("Failed to parse SLINT_KMS_ROTATION: {e}"))
             })?;
 
-        let renderer =
-            (self.renderer_factory)(&device_accessor, self.requested_graphics_api.as_ref())?;
-        let adapter =
-            FullscreenWindowAdapter::new(renderer, rotation, self.suspended.clone())?;
+        let adapter = FullscreenWindowAdapter::new(
+            (self.renderer_factory)(
+                &self.shared.device_accessor(),
+                self.requested_graphics_api.as_ref(),
+            )?,
+            rotation,
+            self.shared.suspended.clone(),
+        )?;
 
-        *self.window.borrow_mut() = Some(adapter.clone());
+        *self.shared.window.borrow_mut() = Some(adapter.clone());
 
         Ok(adapter)
     }
 
     fn run_event_loop(&self) -> Result<(), PlatformError> {
-        let mut event_loop: EventLoop<LoopData> =
+        let mut event_loop: EventLoop<()> =
             EventLoop::try_new().map_err(|e| format!("Error creating event loop: {}", e))?;
 
         let loop_signal = event_loop.get_signal();
 
         *self.proxy.loop_signal.lock().unwrap() = Some(loop_signal.clone());
-        if let Some(adapter) = self.window.borrow().as_ref() {
+        if let Some(adapter) = self.shared.window.borrow().as_ref() {
             adapter.set_loop_signal(loop_signal.clone());
         }
         let quit_loop = self.proxy.quit_loop.clone();
 
         #[cfg(feature = "libinput")]
         let mouse_position_property = input::LibInputHandler::init(
-            &self.window,
+            &self.shared.window,
             &event_loop.handle(),
             &self.libinput_event_hook,
         )?;
@@ -273,11 +300,9 @@ impl i_slint_core::platform::Platform for Backend {
                 .into());
         };
 
-        // sgc fork: run the app-registered hooks (e.g. inserting a poll source
-        // on the resource-controller socket) now that the loop handle exists.
-        for hook in self.event_loop_hooks.borrow_mut().drain(..) {
-            hook(&event_loop.handle())?;
-        }
+        // Drain whatever the daemon sent between `build` (acquire) and the
+        // loop starting — e.g. an immediate revoke — before the first frame.
+        pump_sgc(&self.shared, &self.sgc_session)?;
 
         let callbacks_to_invoke_per_iteration = Rc::new(RefCell::new(Vec::new()));
 
@@ -297,7 +322,34 @@ impl i_slint_core::platform::Platform for Backend {
                 },
             )?;
 
-        let mut loop_data = LoopData::default();
+        // sgc pump: poll the session socket on a short timer (the daemon is
+        // purely event-driven; nothing wakes us otherwise). Revoke/regrant are
+        // handled here, on the event-loop thread — suspend stops rendering
+        // before the next frame, a re-grant rebuilds the display stack and
+        // requests a redraw. A lost connection or failed rebuild is fatal.
+        {
+            let shared = self.shared.clone();
+            let session = self.sgc_session.clone();
+            let fatal = self.fatal.clone();
+            let quit_loop = quit_loop.clone();
+            let wakeup = loop_signal.clone();
+            event_loop
+                .handle()
+                .insert_source(calloop::timer::Timer::from_duration(SGC_PUMP_INTERVAL), {
+                    move |_deadline, _, _| {
+                        if let Err(err) = pump_sgc(&shared, &session) {
+                            eprintln!("linuxsgc: sgc session lost: {err}");
+                            *fatal.borrow_mut() = Some(err);
+                            quit_loop.store(true, std::sync::atomic::Ordering::Release);
+                            wakeup.wakeup();
+                        }
+                        calloop::timer::TimeoutAction::ToDuration(SGC_PUMP_INTERVAL)
+                    }
+                })
+                .map_err(|e: calloop::InsertError<calloop::timer::Timer>| {
+                    format!("Error registering sgc pump source: {e}")
+                })?;
+        }
 
         quit_loop.store(false, std::sync::atomic::Ordering::Release);
 
@@ -310,14 +362,20 @@ impl i_slint_core::platform::Platform for Backend {
                 callback();
             }
 
-            if let Some(adapter) = self.window.borrow().as_ref() {
+            if let Some(adapter) = self.shared.window.borrow().as_ref() {
                 adapter.clone().render_if_needed(mouse_position_property.as_ref())?;
             };
 
             let next_timeout = i_slint_core::platform::duration_until_next_timer_update();
             event_loop
-                .dispatch(next_timeout, &mut loop_data)
+                .dispatch(next_timeout, &mut ())
                 .map_err(|e| format!("Error dispatch events: {e}"))?;
+        }
+
+        // A fatal sgc error (daemon gone, rebuild failed) takes precedence over
+        // a clean app quit.
+        if let Some(err) = self.fatal.borrow_mut().take() {
+            return Err(err);
         }
 
         Ok(())
@@ -348,6 +406,3 @@ impl i_slint_core::platform::Platform for Backend {
         }
     }
 }
-
-#[derive(Default)]
-pub struct LoopData {}

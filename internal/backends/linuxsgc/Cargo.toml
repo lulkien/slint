@@ -6,19 +6,23 @@
 # sgc fork of the linuxkms backend (WIP, sgc-lease-1.17): copy of the 1.17
 # release branch's i-slint-backend-linuxkms, trimmed to Linux and to the
 # renderers we use (software + femtovg GL), with sgc-specific changes:
-#   - BackendBuilder::with_drm_device: render on an injected DRM (lease) fd
-#   - revoke/regrant survival (renderer rebuild, suspend, event-loop hooks)
+#   - the backend OWNS its sgc session: Backend::build connects to the @sgc
+#     daemon, acquires a DRM card lease and renders on it (sgc or die: no
+#     direct /dev/dri open, no fbdev fallback); the event loop pumps the
+#     session — revoke suspends rendering, re-grant rebuilds the display
+#     stack (software renderer; the GL stack cannot be rebuilt in-process
+#     and the process exits with an error when preempted)
 #   - fontique fontconfig-dlopen baked in (no libfontconfig link-time dep,
 #     keeps fully static musl builds possible)
 #   - input handling (libinput) is OPT-IN here (upstream 1.17 had it
 #     unconditional, dragging libudev into every build); enable `libinput` when
 #     input support is needed. No libseat anywhere: this backend renders on an
-#     sgc lease (or runs as root) and opens /dev/input directly.
+#     sgc lease and opens /dev/input directly.
 # Keep the upstream linuxkms crate pristine so syncing stays conflict-free; do
 # NOT port changes back into i-slint-backend-linuxkms.
 [package]
 name = "i-slint-backend-linuxsgc"
-description = "slint DRM/KMS backend (sgc fork, Linux): render on an injected DRM lease fd"
+description = "slint backend (sgc fork, Linux): fullscreen UI on a DRM lease granted by the simple-graphics-controller daemon"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -49,6 +53,10 @@ i-slint-core = { workspace = true, features = ["default", "image-decoders", "svg
 i-slint-common = { workspace = true, features = ["default"] }
 i-slint-renderer-femtovg = { workspace = true, features = ["default"], optional = true }
 i-slint-renderer-software = { workspace = true, optional = true }
+# sgc: the backend drives its own session against the simple-graphics-controller
+# daemon (connect @sgc, acquire the card lease, pump revoke/re-grant). Path dep
+# during development; move to a git dep once libsgc-rs gets its own repo.
+libsgc-rs = { path = "../../../../simple-graphics-controller/libsgc-rs" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input = { workspace = true, default-features = true, optional = true }

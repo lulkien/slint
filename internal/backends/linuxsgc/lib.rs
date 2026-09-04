@@ -8,9 +8,10 @@
 //! sgc fork of the linuxkms backend (Linux only; trimmed to the renderers we
 //! use). See the crate header in Cargo.toml.
 
-mod fullscreenwindowadapter;
 mod calloop_backend;
 mod display;
+mod fullscreenwindowadapter;
+mod sgc;
 
 use std::os::fd::OwnedFd;
 
@@ -70,9 +71,9 @@ mod renderer {
     }
 }
 
-// sgc fork: exported so apps can keep an `Rc<Backend>` (revoke/regrant API) and
-// type event-loop hooks against the loop data.
-pub use calloop_backend::{Backend, LoopData};
+// sgc fork: exported so apps can install the backend platform
+// (`BackendBuilder::default().build()` then `slint::platform::set_platform`).
+pub use calloop_backend::Backend;
 
 use i_slint_core::api::PlatformError;
 
@@ -84,9 +85,6 @@ pub struct BackendBuilder {
     /// receives no input events.
     #[cfg(feature = "libinput")]
     pub(crate) libinput_event_hook: Option<Box<dyn Fn(&input::Event) -> bool>>,
-    /// sgc lease (WIP): render on a pre-opened DRM fd (e.g. a lease granted by a
-    /// controller daemon) instead of opening /dev/dri/cardN directly.
-    pub(crate) drm_fd: Option<(u8, std::rc::Rc<OwnedFd>)>,
 }
 
 impl BackendBuilder {
@@ -112,15 +110,12 @@ impl BackendBuilder {
         self
     }
 
-    /// sgc lease (WIP): render on a pre-opened DRM fd for `/dev/dri/card{card_index}`
-    /// instead of opening the device directly. `fd` may be a DRM lease: everything
-    /// downstream (connector/mode probing, gbm, dumb buffers, page flips) works on a
-    /// lease fd without DRM master. The fd must stay valid for the backend's lifetime.
-    pub fn with_drm_device(mut self, card_index: u8, fd: OwnedFd) -> Self {
-        self.drm_fd = Some((card_index, std::rc::Rc::new(fd)));
-        self
-    }
-
+    /// Build the backend: connects to the @sgc daemon, acquires a DRM card
+    /// lease, and prepares rendering on it. Fails if the daemon is unreachable,
+    /// advertises no DRM card, or denies the acquire — there is no fallback
+    /// (sgc or die). The acquired session is owned by the backend for its
+    /// lifetime: revoke suspends rendering until the lease is re-granted, on
+    /// which the display stack is rebuilt.
     pub fn build(self) -> Result<Backend, PlatformError> {
         Backend::build(self)
     }
