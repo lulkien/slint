@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 // cSpell: ignore CLOEXEC GETFL NOCTTY NONBLOCK
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 #[cfg(not(feature = "libseat"))]
 use std::fs::OpenOptions;
 use std::os::fd::OwnedFd;
@@ -35,6 +35,9 @@ struct Proxy {
     quit_loop: Arc<AtomicBool>,
     user_event_channel: Arc<Mutex<calloop::channel::Sender<Box<dyn FnOnce() + Send>>>>,
 }
+
+type EventLoopHook =
+    Box<dyn for<'a> FnOnce(&calloop::LoopHandle<'a, LoopData>) -> Result<(), PlatformError>>;
 
 impl Proxy {
     fn new(event_channel: calloop::channel::Sender<Box<dyn FnOnce() + Send>>) -> Self {
@@ -77,10 +80,16 @@ pub struct Backend {
     window: RefCell<Option<Rc<FullscreenWindowAdapter>>>,
     user_event_receiver: RefCell<Option<calloop::channel::Channel<Box<dyn FnOnce() + Send>>>>,
     proxy: Proxy,
-    /// sgc lease (WIP): when set, `create_window_adapter` renders on this fd for
-    /// /dev/dri/card{index} instead of opening the device (see
-    /// `BackendBuilder::with_drm_device`).
-    drm_fd: Option<(u8, Rc<OwnedFd>)>,
+    /// sgc fork: the injected DRM (lease) fd, in a shared slot so it can be
+    /// swapped when a revoked lease is re-granted (see `set_drm_fd`).
+    drm_fd: Rc<RefCell<Option<(u8, Rc<OwnedFd>)>>>,
+    /// While set, the window adapter skips rendering (revoked lease pending
+    /// re-grant). Shared with the adapter.
+    suspended: Rc<Cell<bool>>,
+    /// sgc fork: sources the app wants registered in the backend's event loop
+    /// (e.g. a poll source on the resource-controller socket). Run once, at
+    /// the top of `run_event_loop`.
+    event_loop_hooks: RefCell<Vec<EventLoopHook>>,
     renderer_factory:
         fn(
             &crate::DeviceOpener,
@@ -160,7 +169,9 @@ impl Backend {
             window: Default::default(),
             user_event_receiver: RefCell::new(Some(user_event_receiver)),
             proxy: Proxy::new(user_event_sender),
-            drm_fd: builder.drm_fd,
+            drm_fd: Rc::new(RefCell::new(builder.drm_fd)),
+            suspended: Rc::new(Cell::new(false)),
+            event_loop_hooks: RefCell::new(Vec::new()),
             renderer_factory,
             requested_graphics_api: builder.requested_graphics_api,
             sel_clipboard: Default::default(),
@@ -168,6 +179,149 @@ impl Backend {
             #[cfg(feature = "libinput")]
             libinput_event_hook: builder.libinput_event_hook,
         })
+    }
+}
+
+// sgc fork: device opener that renders on the currently injected DRM (lease)
+// fd (or opens the device directly / via libseat when none is injected), plus
+// the revoke/regrant API. The opener is rebuilt on every call so a swapped fd
+// (re-grant) is picked up by the next renderer rebuild.
+impl Backend {
+    fn device_accessor(&self) -> Box<crate::DeviceOpener<'static>> {
+        if let Some((card_index, fd)) = self.drm_fd.borrow().as_ref() {
+            let card_name = format!("card{card_index}");
+            let fd = fd.clone();
+            return Box::new(
+                move |device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
+                    if device.file_name().and_then(|name| name.to_str())
+                        != Some(card_name.as_str())
+                    {
+                        return Err(format!(
+                            "Refusing to open {}: rendering on the injected DRM fd for card{}",
+                            device.display(),
+                            card_index
+                        )
+                        .into());
+                    }
+                    // For polling for drm::control::Event::PageFlip we need a
+                    // blocking FD (mirrors the libseat arm). The fd is a dup of
+                    // the injector's — this clears O_NONBLOCK on the shared open
+                    // file description; the injector must not rely on it.
+                    let fd_borrowed = fd.as_fd();
+                    let flags = nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_GETFL)
+                        .map_err(|e| format!("Error getting file descriptor flags: {e}"))?;
+                    let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
+                    flags.remove(nix::fcntl::OFlag::O_NONBLOCK);
+                    nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_SETFL(flags))
+                        .map_err(|e| format!("Error making device fd blocking: {e}"))?;
+                    Ok(fd.clone())
+                },
+            );
+        }
+
+        #[cfg(feature = "libseat")]
+        {
+            let seat = self.seat.clone();
+            Box::new(move |device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
+                let device = seat
+                    .borrow_mut()
+                    .open_device(device)
+                    .map_err(|e| format!("Error opening device {}: {e}", device.display()))?;
+
+                // For polling for drm::control::Event::PageFlip we need a blocking FD.
+                let fd = device.as_fd();
+                let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL)
+                    .map_err(|e| format!("Error getting file descriptor flags: {e}"))?;
+                let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
+                flags.remove(nix::fcntl::OFlag::O_NONBLOCK);
+                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags))
+                    .map_err(|e| format!("Error making device fd non-blocking: {e}"))?;
+
+                // Safety: We take ownership of the now shared FD, ... although we should be using libseat's close_device....
+                Ok(Rc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd.as_raw_fd()) }))
+            })
+        }
+
+        #[cfg(not(feature = "libseat"))]
+        {
+            Box::new(|device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
+                let device = OpenOptions::new()
+                    .custom_flags((nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC).bits())
+                    .read(true)
+                    .write(true)
+                    .open(device)
+                    .map(|file| file.into())
+                    .map_err(|e| format!("Error opening device {}: {e}", device.display()))?;
+
+                Ok(Rc::new(device))
+            })
+        }
+    }
+
+    /// sgc fork: swap the injected DRM fd for a fresh one (a re-granted lease
+    /// after a revoke). Call [`Self::rebuild_renderer`] afterwards; rendering
+    /// must be suspended (`set_suspended(true)`) in between.
+    pub fn set_drm_fd(&self, card_index: u8, fd: OwnedFd) {
+        *self.drm_fd.borrow_mut() = Some((card_index, Rc::new(fd)));
+    }
+
+    /// sgc fork: while suspended the window adapter renders nothing (a revoked
+    /// lease fd must not be touched until it is re-granted and rebuilt).
+    pub fn set_suspended(&self, suspended: bool) {
+        self.suspended.set(suspended);
+    }
+
+    /// sgc fork: rebuild the window adapter's display stack on the CURRENT
+    /// injected fd (call after `set_drm_fd` with a re-granted lease). Must run
+    /// on the event-loop thread.
+    pub fn rebuild_renderer(&self) -> Result<(), PlatformError> {
+        let accessor = self.device_accessor();
+        let Some(adapter) = self.window.borrow().clone() else {
+            return Err(PlatformError::Other(
+                "rebuild_renderer: no window adapter yet".into(),
+            ));
+        };
+        adapter.rebuild_renderer(&accessor)
+    }
+
+    /// sgc fork: register a hook that runs once at the top of `run_event_loop`,
+    /// with the loop handle — for inserting extra event sources (e.g. a poll
+    /// source driving the resource-controller client).
+    pub fn add_event_loop_hook(&self, hook: EventLoopHook) {
+        self.event_loop_hooks.borrow_mut().push(hook);
+    }
+}
+
+// sgc fork: allow the app to keep an `Rc<Backend>` handle (for
+// set_drm_fd/set_suspended/rebuild_renderer from event-loop sources) while the
+// platform registry owns a `Box<dyn Platform>`.
+impl i_slint_core::platform::Platform for Rc<Backend> {
+    fn bind_context(&self, ctx: i_slint_core::SlintContextWeak, token: i_slint_core::InternalToken) {
+        (**self).bind_context(ctx, token);
+    }
+
+    fn create_window_adapter(
+        &self,
+    ) -> Result<std::rc::Rc<dyn i_slint_core::window::WindowAdapter>, PlatformError> {
+        (**self).create_window_adapter()
+    }
+
+    fn run_event_loop(&self) -> Result<(), PlatformError> {
+        (**self).run_event_loop()
+    }
+
+    fn new_event_loop_proxy(
+        &self,
+    ) -> Option<Box<dyn i_slint_core::platform::EventLoopProxy>> {
+        (**self).new_event_loop_proxy()
+    }
+
+    fn clipboard_text(&self, clipboard: i_slint_core::platform::Clipboard) -> Option<String> {
+        (**self).clipboard_text(clipboard)
+    }
+
+    fn set_clipboard_text(&self, text: &str, clipboard: i_slint_core::platform::Clipboard) {
+        (**self).set_clipboard_text(text, clipboard);
     }
 }
 
@@ -179,79 +333,7 @@ impl i_slint_core::platform::Platform for Backend {
     fn create_window_adapter(
         &self,
     ) -> Result<std::rc::Rc<dyn i_slint_core::window::WindowAdapter>, PlatformError> {
-        #[cfg(feature = "libseat")]
-        let device_accessor: Box<crate::DeviceOpener<'_>> =
-            Box::new(|device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
-                let device = self
-                    .seat
-                    .borrow_mut()
-                    .open_device(&device)
-                    .map_err(|e| format!("Error opening device {}: {e}", device.display()))?;
-
-                // For polling for drm::control::Event::PageFlip we need a blocking FD. Would be better to do this non-blocking
-                let fd = device.as_fd();
-                let flags = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL)
-                    .map_err(|e| format!("Error getting file descriptor flags: {e}"))?;
-                let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
-                flags.remove(nix::fcntl::OFlag::O_NONBLOCK);
-                nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(flags))
-                    .map_err(|e| format!("Error making device fd non-blocking: {e}"))?;
-
-                // Safety: We take ownership of the now shared FD, ... although we should be using libseat's close_device....
-                Ok(Rc::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd.as_raw_fd()) }))
-            });
-
-        #[cfg(not(feature = "libseat"))]
-        let device_accessor: Box<crate::DeviceOpener<'_>> =
-            Box::new(|device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
-                let device = OpenOptions::new()
-                    .custom_flags((nix::fcntl::OFlag::O_NOCTTY | nix::fcntl::OFlag::O_CLOEXEC).bits())
-                    .read(true)
-                    .write(true)
-                    .open(device)
-                    .map(|file| file.into())
-                    .map_err(|e| format!("Error opening device {}: {e}", device.display()))?;
-
-                Ok(Rc::new(device))
-            });
-
-        // sgc lease (WIP): a pre-opened DRM (lease) fd replaces direct device
-        // opening. Only accept the path of the card the fd belongs to, so other
-        // probes (e.g. the linuxfb fallback asking for /dev/fb0) are refused.
-        let device_accessor = match self.drm_fd.as_ref() {
-            Some((card_index, fd)) => {
-                let card_name = format!("card{card_index}");
-                let fd = fd.clone();
-                let injected: Box<crate::DeviceOpener<'_>> = Box::new(
-                    move |device: &std::path::Path| -> Result<Rc<OwnedFd>, PlatformError> {
-                        if device.file_name().and_then(|name| name.to_str()) != Some(card_name.as_str())
-                        {
-                            return Err(format!(
-                                "Refusing to open {}: rendering on the injected DRM fd for card{}",
-                                device.display(),
-                                card_index
-                            )
-                            .into());
-                        }
-                        // For polling for drm::control::Event::PageFlip we need a
-                        // blocking FD (mirrors the libseat arm above). Note: the
-                        // fd is a dup of the injector's — this clears O_NONBLOCK
-                        // on the shared open file description; the injector must
-                        // not rely on O_NONBLOCK on that fd afterwards.
-                        let fd_borrowed = fd.as_fd();
-                        let flags = nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_GETFL)
-                            .map_err(|e| format!("Error getting file descriptor flags: {e}"))?;
-                        let mut flags = nix::fcntl::OFlag::from_bits_retain(flags);
-                        flags.remove(nix::fcntl::OFlag::O_NONBLOCK);
-                        nix::fcntl::fcntl(fd_borrowed, nix::fcntl::FcntlArg::F_SETFL(flags))
-                            .map_err(|e| format!("Error making device fd blocking: {e}"))?;
-                        Ok(fd.clone())
-                    },
-                );
-                injected
-            }
-            None => device_accessor,
-        };
+        let device_accessor = self.device_accessor();
 
         // This could be per-screen, once we support multiple outputs
         let rotation =
@@ -264,7 +346,8 @@ impl i_slint_core::platform::Platform for Backend {
 
         let renderer =
             (self.renderer_factory)(&device_accessor, self.requested_graphics_api.as_ref())?;
-        let adapter = FullscreenWindowAdapter::new(renderer, rotation)?;
+        let adapter =
+            FullscreenWindowAdapter::new(renderer, rotation, self.suspended.clone())?;
 
         *self.window.borrow_mut() = Some(adapter.clone());
 
@@ -304,6 +387,12 @@ impl i_slint_core::platform::Platform for Backend {
                 .to_string()
                 .into());
         };
+
+        // sgc fork: run the app-registered hooks (e.g. inserting a poll source
+        // on the resource-controller socket) now that the loop handle exists.
+        for hook in self.event_loop_hooks.borrow_mut().drain(..) {
+            hook(&event_loop.handle())?;
+        }
 
         let callbacks_to_invoke_per_iteration = Rc::new(RefCell::new(Vec::new()));
 

@@ -14,9 +14,11 @@ use crate::display::RenderingRotation;
 
 pub struct SoftwareRendererAdapter {
     renderer: SoftwareRenderer,
-    display: Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>,
-    presenter: Arc<dyn crate::display::Presenter>,
-    size: PhysicalWindowSize,
+    /// fd-bound display stack; rebuilt on lease re-grant (the SoftwareRenderer
+    /// itself is fd-independent and survives a rebuild).
+    display: std::cell::RefCell<Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>>,
+    presenter: std::cell::RefCell<Arc<dyn crate::display::Presenter>>,
+    size: std::cell::Cell<i_slint_core::api::PhysicalSize>,
 }
 
 const SOFTWARE_RENDER_SUPPORTED_DRM_FOURCC_FORMATS: &[drm::buffer::DrmFourcc] = &[
@@ -152,6 +154,30 @@ impl SoftwareRendererAdapter {
         device_opener: &crate::DeviceOpener,
         _requested_graphics_api: Option<&i_slint_core::graphics::RequestedGraphicsAPI>,
     ) -> Result<Box<dyn crate::fullscreenwindowadapter::FullscreenRenderer>, PlatformError> {
+        let renderer = Box::new(Self {
+            renderer: SoftwareRenderer::new(),
+            display: Default::default(),
+            presenter: Default::default(),
+            size: Default::default(),
+        });
+
+        renderer.init_display(device_opener)?;
+
+        eprintln!("Using Software renderer");
+
+        Ok(renderer)
+    }
+
+    /// (Re)create the fd-bound display stack (dumb buffers, framebuffers, crtc
+    /// state) on the current device. Called at startup and again when a DRM
+    /// lease is re-granted after a revoke: the old stack died with the revoked
+    /// lease fd, everything display-side is rebuilt on the fresh fd. The
+    /// SoftwareRenderer itself is untouched (fd-independent); the next render
+    /// paints the first frame of the new stack fully (fresh buffer age).
+    fn init_display(
+        &self,
+        device_opener: &crate::DeviceOpener,
+    ) -> Result<(), PlatformError> {
         let display = crate::display::swdisplay::new(
             device_opener,
             SOFTWARE_RENDER_SUPPORTED_DRM_FOURCC_FORMATS,
@@ -160,16 +186,10 @@ impl SoftwareRendererAdapter {
         let (width, height) = display.size();
         let size = i_slint_core::api::PhysicalSize::new(width, height);
 
-        let renderer = Box::new(Self {
-            renderer: SoftwareRenderer::new(),
-            display: display.clone(),
-            presenter: display.as_presenter(),
-            size,
-        });
-
-        eprintln!("Using Software renderer");
-
-        Ok(renderer)
+        *self.display.borrow_mut() = display.clone();
+        *self.presenter.borrow_mut() = display.as_presenter();
+        self.size.set(size);
+        Ok(())
     }
 }
 
@@ -183,7 +203,8 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
         rotation: RenderingRotation,
         _draw_mouse_cursor_callback: &dyn Fn(&mut dyn i_slint_core::item_rendering::ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError> {
-        self.display.map_back_buffer(&mut |pixels, age, format| {
+        let size = self.size.get();
+        self.display.borrow().map_back_buffer(&mut |pixels, age, format| {
             self.renderer.set_repaint_buffer_type(match age {
                 1 => RepaintBufferType::ReusedBuffer,
                 2 => RepaintBufferType::SwappedBuffers,
@@ -208,17 +229,17 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
             match format {
                 drm::buffer::DrmFourcc::Xrgb8888 | drm::buffer::DrmFourcc::Argb8888 => {
                     let buffer: &mut [DumbBufferPixelXrgb888] = bytemuck::cast_slice_mut(pixels);
-                    self.renderer.render(buffer, self.size.width as usize);
+                    self.renderer.render(buffer, size.width as usize);
                 }
 
                 drm::buffer::DrmFourcc::Bgra8888 => {
                     let buffer: &mut [DumbBufferPixelBgra8888] = bytemuck::cast_slice_mut(pixels);
-                    self.renderer.render(buffer, self.size.width as usize);
+                    self.renderer.render(buffer, size.width as usize);
                 }
                 drm::buffer::DrmFourcc::Rgb565 => {
                     let buffer: &mut [i_slint_renderer_software::Rgb565Pixel] =
                         bytemuck::cast_slice_mut(pixels);
-                    self.renderer.render(buffer, self.size.width as usize);
+                    self.renderer.render(buffer, size.width as usize);
                 }
                 _ => {
                     return Err(format!(
@@ -230,11 +251,16 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
 
             Ok(())
         })?;
-        self.presenter.present()?;
+        self.presenter.borrow().present()?;
         Ok(DrawOutcome::Success)
     }
 
     fn size(&self) -> i_slint_core::api::PhysicalSize {
-        self.size
+        self.size.get()
+    }
+
+    fn rebuild(&self, device_opener: &crate::DeviceOpener) -> Result<(), PlatformError> {
+        self.init_display(device_opener)?;
+        Ok(())
     }
 }

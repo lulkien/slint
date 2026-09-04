@@ -94,6 +94,11 @@ mod calloop_backend;
 #[cfg(target_os = "linux")]
 use calloop_backend::*;
 
+// sgc fork: exported so apps can keep an `Rc<Backend>` (revoke/regrant API) and
+// type event-loop hooks against the loop data.
+#[cfg(target_os = "linux")]
+pub use calloop_backend::{Backend, LoopData};
+
 #[cfg(not(target_os = "linux"))]
 mod noop_backend;
 use i_slint_core::api::PlatformError;

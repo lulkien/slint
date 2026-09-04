@@ -29,6 +29,15 @@ pub trait FullscreenRenderer {
         draw_mouse_cursor_callback: &dyn Fn(&mut dyn ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError>;
     fn size(&self) -> PhysicalWindowSize;
+    /// sgc fork: recreate anything bound to the (revoked) DRM fd on the current
+    /// device. Called after a lease is re-granted. Renderers whose state cannot
+    /// be rebuilt in-process (e.g. OpenGL: the EGL/GL context dies with the
+    /// lease fd) report an error here.
+    fn rebuild(&self, _device_opener: &crate::DeviceOpener) -> Result<(), PlatformError> {
+        Err(PlatformError::Other(
+            "renderer rebuild not supported for this renderer (sgc fork)".into(),
+        ))
+    }
 }
 
 pub struct FullscreenWindowAdapter {
@@ -38,6 +47,9 @@ pub struct FullscreenWindowAdapter {
     rotation: RenderingRotation,
     loop_signal: RefCell<Option<calloop::LoopSignal>>,
     mouse_cursor: RefCell<MouseCursorInner>,
+    /// While set, render_if_needed does nothing (lease revoked; the display
+    /// stack is dead until re-granted and rebuilt).
+    suspended: Rc<Cell<bool>>,
 }
 
 impl WindowAdapter for FullscreenWindowAdapter {
@@ -89,6 +101,7 @@ impl FullscreenWindowAdapter {
     pub fn new(
         renderer: Box<dyn FullscreenRenderer>,
         rotation: RenderingRotation,
+        suspended: Rc<Cell<bool>>,
     ) -> Result<Rc<Self>, PlatformError> {
         let size = renderer.size();
         let rotation_degrees = rotation.degrees();
@@ -109,6 +122,7 @@ impl FullscreenWindowAdapter {
             rotation,
             loop_signal: RefCell::new(None),
             mouse_cursor: RefCell::new(MouseCursorInner::default()),
+            suspended,
         }))
     }
 
@@ -116,10 +130,35 @@ impl FullscreenWindowAdapter {
         *self.loop_signal.borrow_mut() = Some(signal);
     }
 
+    /// sgc fork: rebuild the renderer's fd-bound display stack on the current
+    /// device (after a lease re-grant). If the output size changed, dispatch
+    /// Resized so the slint scene relayouts.
+    pub fn rebuild_renderer(
+        &self,
+        device_opener: &crate::DeviceOpener,
+    ) -> Result<(), PlatformError> {
+        let old_size = self.renderer.size();
+        self.renderer.rebuild(device_opener)?;
+        let new_size = self.renderer.size();
+        if new_size != old_size {
+            let scale = self.window.scale_factor();
+            self.window.dispatch_event(WindowEvent::Resized {
+                size: new_size.to_logical(scale),
+            });
+        }
+        self.request_redraw();
+        Ok(())
+    }
+
     pub fn render_if_needed(
         self: Rc<Self>,
         mouse_position: Pin<&Property<Option<LogicalPosition>>>,
     ) -> Result<(), PlatformError> {
+        // sgc fork: while a revoked lease is pending re-grant, the display stack
+        // is dead — do nothing (and keep the pending redraw for after resume).
+        if self.suspended.get() {
+            return Ok(());
+        }
         if self.redraw_requested.replace(false) {
             let outcome = self.renderer.render_and_present(self.rotation, &|item_renderer| {
                 if let Some(mouse_position) = mouse_position.get() {
