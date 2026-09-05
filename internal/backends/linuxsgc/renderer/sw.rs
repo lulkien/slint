@@ -173,10 +173,7 @@ impl SoftwareRendererAdapter {
     /// lease fd, everything display-side is rebuilt on the fresh fd. The
     /// SoftwareRenderer itself is untouched (fd-independent); the next render
     /// paints the first frame of the new stack fully (fresh buffer age).
-    fn init_display(
-        &self,
-        device_opener: &crate::DeviceOpener,
-    ) -> Result<(), PlatformError> {
+    fn init_display(&self, device_opener: &crate::DeviceOpener) -> Result<(), PlatformError> {
         let display = crate::display::swdisplay::new(
             device_opener,
             SOFTWARE_RENDER_SUPPORTED_DRM_FOURCC_FORMATS,
@@ -206,9 +203,33 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
     fn render_and_present(
         &self,
         rotation: RenderingRotation,
+        mouse_position: Option<i_slint_core::api::PhysicalPosition>,
         _draw_mouse_cursor_callback: &dyn Fn(&mut dyn i_slint_core::item_rendering::ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError> {
         let size = self.size.get();
+        // The (cached) cursor bitmap to composite over the frame, when a
+        // pointer exists: the rasterized cursor pixels (an Rc clone — cheap).
+        // Extracted before mapping the back buffer so the pixel slice can be
+        // borrowed inside the render closure.
+        let cursor = mouse_position.map(|_| {
+            let image = crate::fullscreenwindowadapter::mouse_cursor_image();
+            let inner: &i_slint_core::graphics::ImageInner = (&image).into();
+            let i_slint_core::graphics::ImageInner::EmbeddedImage { buffer, .. } = inner else {
+                unreachable!("mouse_cursor_image always returns the rasterized cursor");
+            };
+            match buffer {
+                // svg.render produces RGBA8Premultiplied; both variants carry
+                // the same pixel type, and blending treats the source as
+                // premultiplied either way.
+                i_slint_core::graphics::SharedImageBuffer::RGBA8(pixels)
+                | i_slint_core::graphics::SharedImageBuffer::RGBA8Premultiplied(pixels) => {
+                    pixels.clone()
+                }
+                i_slint_core::graphics::SharedImageBuffer::RGB8(_) => {
+                    unreachable!("the cursor image is RGBA")
+                }
+            }
+        });
         self.current_display().map_back_buffer(&mut |pixels, age, format| {
             self.renderer.set_repaint_buffer_type(match age {
                 1 => RepaintBufferType::ReusedBuffer,
@@ -231,20 +252,72 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
                 }
             });
 
+            let cursor = cursor.as_ref().map(|pixels| {
+                (pixels.width() as usize, pixels.height() as usize, pixels.as_slice())
+            });
+
             match format {
                 drm::buffer::DrmFourcc::Xrgb8888 | drm::buffer::DrmFourcc::Argb8888 => {
                     let buffer: &mut [DumbBufferPixelXrgb888] = bytemuck::cast_slice_mut(pixels);
                     self.renderer.render(buffer, size.width as usize);
+                    if let (
+                        Some((cursor_width, cursor_height, cursor_pixels)),
+                        Some(mouse_position),
+                    ) = (cursor, mouse_position)
+                    {
+                        composite_cursor(
+                            buffer,
+                            size.width as usize,
+                            size.height as usize,
+                            rotation,
+                            mouse_position,
+                            cursor_pixels,
+                            cursor_width,
+                            cursor_height,
+                        );
+                    }
                 }
 
                 drm::buffer::DrmFourcc::Bgra8888 => {
                     let buffer: &mut [DumbBufferPixelBgra8888] = bytemuck::cast_slice_mut(pixels);
                     self.renderer.render(buffer, size.width as usize);
+                    if let (
+                        Some((cursor_width, cursor_height, cursor_pixels)),
+                        Some(mouse_position),
+                    ) = (cursor, mouse_position)
+                    {
+                        composite_cursor(
+                            buffer,
+                            size.width as usize,
+                            size.height as usize,
+                            rotation,
+                            mouse_position,
+                            cursor_pixels,
+                            cursor_width,
+                            cursor_height,
+                        );
+                    }
                 }
                 drm::buffer::DrmFourcc::Rgb565 => {
                     let buffer: &mut [i_slint_renderer_software::Rgb565Pixel] =
                         bytemuck::cast_slice_mut(pixels);
                     self.renderer.render(buffer, size.width as usize);
+                    if let (
+                        Some((cursor_width, cursor_height, cursor_pixels)),
+                        Some(mouse_position),
+                    ) = (cursor, mouse_position)
+                    {
+                        composite_cursor(
+                            buffer,
+                            size.width as usize,
+                            size.height as usize,
+                            rotation,
+                            mouse_position,
+                            cursor_pixels,
+                            cursor_width,
+                            cursor_height,
+                        );
+                    }
                 }
                 _ => {
                     return Err(format!(
@@ -256,11 +329,7 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
 
             Ok(())
         })?;
-        self.presenter
-            .borrow()
-            .as_ref()
-            .expect("presenter initialized")
-            .present()?;
+        self.presenter.borrow().as_ref().expect("presenter initialized").present()?;
         Ok(DrawOutcome::Success)
     }
 
@@ -272,4 +341,74 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for SoftwareRendererAdap
         self.init_display(device_opener)?;
         Ok(())
     }
+}
+
+/// Blend the cached mouse-cursor bitmap over the rendered frame at the
+/// pointer position (window physical coordinates, post-scale). The buffer
+/// holds the frame in the screen's orientation, so window coordinates are
+/// mapped with the same mirror + transpose transform the software renderer
+/// applies to the scene — the cursor tracks the pointer under any
+/// SLINT_KMS_ROTATION. The cursor pixels are premultiplied RGBA (the slint
+/// image convention), which is what `TargetPixel::blend` expects.
+fn composite_cursor<P: TargetPixel>(
+    buffer: &mut [P],
+    screen_width: usize,
+    screen_height: usize,
+    rotation: RenderingRotation,
+    mouse_position: i_slint_core::api::PhysicalPosition,
+    cursor_pixels: &[i_slint_core::graphics::Rgba8Pixel],
+    cursor_width: usize,
+    cursor_height: usize,
+) {
+    let (screen_width, screen_height) = (screen_width as i32, screen_height as i32);
+    // The cursor's top-left sits at the pointer (mirroring the gl path,
+    // which translates the item renderer to the position before drawing).
+    let origin_x = mouse_position.x;
+    let origin_y = mouse_position.y;
+    for cy in 0..cursor_height as i32 {
+        for cx in 0..cursor_width as i32 {
+            let (bx, by) = window_to_buffer(
+                rotation,
+                screen_width,
+                screen_height,
+                origin_x + cx,
+                origin_y + cy,
+            );
+            if bx < 0 || bx >= screen_width || by < 0 || by >= screen_height {
+                continue;
+            }
+            let src = cursor_pixels[(cy * cursor_width as i32 + cx) as usize];
+            let dst = &mut buffer[(by * screen_width + bx) as usize];
+            // `Rgba8Pixel` is the rgb crate's RGBA8: r/g/b/a (premultiplied).
+            dst.blend(PremultipliedRgbaColor {
+                red: src.r,
+                green: src.g,
+                blue: src.b,
+                alpha: src.a,
+            });
+        }
+    }
+}
+
+/// Map a window-space pixel (physical, pre-rotation) to its position in the
+/// screen-oriented frame buffer — the same mirror + transpose transform the
+/// software renderer applies to the scene.
+fn window_to_buffer(
+    rotation: RenderingRotation,
+    screen_width: i32,
+    screen_height: i32,
+    x: i32,
+    y: i32,
+) -> (i32, i32) {
+    let (mut x, mut y) = (x, y);
+    if matches!(rotation, RenderingRotation::Rotate270 | RenderingRotation::Rotate180) {
+        x = screen_width - 1 - x;
+    }
+    if matches!(rotation, RenderingRotation::Rotate90 | RenderingRotation::Rotate180) {
+        y = screen_height - 1 - y;
+    }
+    if matches!(rotation, RenderingRotation::Rotate90 | RenderingRotation::Rotate270) {
+        std::mem::swap(&mut x, &mut y);
+    }
+    (x, y)
 }

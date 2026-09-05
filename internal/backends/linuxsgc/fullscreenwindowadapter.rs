@@ -8,7 +8,7 @@ use std::pin::Pin;
 use std::rc::Rc;
 
 use i_slint_core::Property;
-use i_slint_core::api::{LogicalPosition, PhysicalSize as PhysicalWindowSize};
+use i_slint_core::api::{LogicalPosition, PhysicalPosition, PhysicalSize as PhysicalWindowSize};
 use i_slint_core::graphics::{Image, euclid};
 use i_slint_core::item_rendering::ItemRenderer;
 use i_slint_core::lengths::LogicalRect;
@@ -24,6 +24,13 @@ pub trait FullscreenRenderer {
     fn render_and_present(
         &self,
         rotation: RenderingRotation,
+        // The pointer position in physical window coordinates (logical
+        // position scaled by the window scale factor), when a pointer
+        // exists. Renderers draw the mouse cursor over the frame: the GL
+        // renderer through `draw_mouse_cursor_callback` (its own transform
+        // maps logical space), the software renderer by compositing the
+        // cursor bitmap into the frame buffer at this position.
+        mouse_position: Option<PhysicalPosition>,
         draw_mouse_cursor_callback: &dyn Fn(&mut dyn ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError>;
     fn size(&self) -> PhysicalWindowSize;
@@ -125,9 +132,7 @@ impl FullscreenWindowAdapter {
         if new_size != old_size {
             let scale = self.window.scale_factor();
             self.window
-                .try_dispatch_event(WindowEvent::Resized {
-                    size: new_size.to_logical(scale),
-                })
+                .try_dispatch_event(WindowEvent::Resized { size: new_size.to_logical(scale) })
                 .ok();
         }
         self.request_redraw();
@@ -144,22 +149,34 @@ impl FullscreenWindowAdapter {
             return Ok(());
         }
         if self.redraw_requested.replace(false) {
-            let outcome = self.renderer.render_and_present(self.rotation, &|item_renderer| {
-                if let Some(mouse_position) = mouse_position.get() {
-                    let cursor_image = mouse_cursor_image();
-                    item_renderer.save_state();
-                    item_renderer.translate(
-                        i_slint_core::lengths::logical_point_from_api(mouse_position).to_vector(),
-                    );
-                    item_renderer.draw_image_direct(mouse_cursor_image());
-                    item_renderer.restore_state();
-                    let cursor_rect = LogicalRect::new(
-                        euclid::point2(mouse_position.x, mouse_position.y),
-                        euclid::Size2D::from_untyped(cursor_image.size().cast()),
-                    );
-                    self.renderer.as_core_renderer().mark_dirty_region(cursor_rect.into());
-                }
-            })?;
+            // Physical (post-scale) pointer position, for renderers that draw
+            // the cursor themselves (the software renderer composites it into
+            // the frame buffer). The GL renderer draws it through the post
+            // render callback instead, in logical space under its transform.
+            let physical_mouse_position = mouse_position
+                .get()
+                .map(|pos| PhysicalPosition::from_logical(pos, self.window.scale_factor()));
+            let outcome = self.renderer.render_and_present(
+                self.rotation,
+                physical_mouse_position,
+                &|item_renderer| {
+                    if let Some(mouse_position) = mouse_position.get() {
+                        let cursor_image = mouse_cursor_image();
+                        item_renderer.save_state();
+                        item_renderer.translate(
+                            i_slint_core::lengths::logical_point_from_api(mouse_position)
+                                .to_vector(),
+                        );
+                        item_renderer.draw_image_direct(mouse_cursor_image());
+                        item_renderer.restore_state();
+                        let cursor_rect = LogicalRect::new(
+                            euclid::point2(mouse_position.x, mouse_position.y),
+                            euclid::Size2D::from_untyped(cursor_image.size().cast()),
+                        );
+                        self.renderer.as_core_renderer().mark_dirty_region(cursor_rect.into());
+                    }
+                },
+            )?;
             if !matches!(outcome, DrawOutcome::Success) {
                 self.redraw_requested.set(true);
             }
@@ -184,7 +201,7 @@ impl FullscreenWindowAdapter {
     }
 }
 
-fn mouse_cursor_image() -> Image {
+pub(crate) fn mouse_cursor_image() -> Image {
     let mouse_pointer_svg = i_slint_core::graphics::load_image_from_embedded_data(
         Slice::from_slice(include_bytes!("mouse-pointer.svg")),
         Slice::from_slice(b"svg"),

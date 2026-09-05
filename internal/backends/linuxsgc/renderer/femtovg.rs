@@ -189,6 +189,7 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for FemtoVGRendererAdapt
     fn render_and_present(
         &self,
         rotation: RenderingRotation,
+        _mouse_position: Option<i_slint_core::api::PhysicalPosition>,
         draw_mouse_cursor_callback: &dyn Fn(&mut dyn ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError> {
         let outcome = self.renderer.render_transformed_with_post_callback(
