@@ -221,6 +221,14 @@ backend-linuxkms-noseat = ["i-slint-backend-selector/backend-linuxkms-noseat", "
 ## `SLINT_BACKEND=linuxsgc` or by enabling no other backend.
 backend-linuxsgc = ["i-slint-backend-selector/backend-linuxsgc", "std"]
 
+## sgc fork: pointer/keyboard/touch input for the `backend-linuxsgc` backend,
+## delivered from the devices the @sgc daemon granted (libinput over the
+## granted fds; the app never touches devices itself). Enable together with
+## `backend-linuxsgc`. Links the system libinput, so it requires a dynamically
+## linked (gnu) build and libinput on the target — keep it out of musl/static
+## builds.
+backend-linuxsgc-libinput = ["i-slint-backend-selector/backend-linuxsgc-libinput", "std"]
+
 ## Use the backend based on the [android-activity](https://docs.rs/android-activity) crate. (Using it's native activity feature)
 backend-android-activity-06 = [
   "i-slint-backend-android-activity/native-activity",

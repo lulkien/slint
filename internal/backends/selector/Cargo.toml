@@ -26,6 +26,11 @@ backend-linuxkms-noseat = ["i-slint-backend-linuxkms"]
 # (i-slint-backend-linuxsgc). No libseat: the backend owns its sgc session
 # and never opens /dev/dri itself.
 backend-linuxsgc = ["i-slint-backend-linuxsgc"]
+# sgc fork: input handling for the linuxsgc backend — pointer/keyboard/touch
+# from the daemon-granted devices, via libinput over the granted fds. Implies
+# `backend-linuxsgc`; links the system libinput, so dynamically linked (gnu)
+# builds only.
+backend-linuxsgc-libinput = ["i-slint-backend-linuxsgc/libinput"]
 backend-qt = ["i-slint-backend-qt/enable"]
 backend-testing = ["i-slint-backend-testing/internal"]
 
