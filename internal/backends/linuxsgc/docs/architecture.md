@@ -23,6 +23,7 @@ between these — `RefCell`/`Rc` only.
 
 ## Ownership
 
+```mermaid
 graph TD
     BE["Backend"] --> SH["Rc&lt;SharedState&gt;"]
     BE --> SES["Rc&lt;SgcSession&gt;"]
@@ -35,6 +36,7 @@ graph TD
     IS2 --> CTX
     CTX --> IFACE["InputRegistry (the LibinputInterface)"]
     SES --> CLIENT["SgcClient (canonical fds)"]
+```
 
 Notes:
 
@@ -51,6 +53,7 @@ Notes:
 
 ## Startup
 
+```mermaid
 sequenceDiagram
     participant A as App (main thread)
     participant S as Selector
@@ -77,6 +80,7 @@ sequenceDiagram
     B->>B: LibInputHandler::init: path_add_device each granted device
     B->>D: drain pending sgc events (pump)
     B->>B: frame loop starts (see below)
+```
 
 The lease fd is stored in `SharedState.drm_fd` at build; the display stack is
 NOT built at build time — it is built lazily when the first window adapter is
@@ -116,6 +120,7 @@ pump error: it is stashed as the fatal error, the loop is stopped, and
 `run_event_loop` returns that error (a session cannot survive without the
 daemon).
 
+```mermaid
 flowchart TD
     EV[event from pump] --> R{resource kind}
     R -->|"Drm{card} == our card"| DRM[DRM handling]
@@ -130,6 +135,7 @@ flowchart TD
     REG --> ERR{rebuild failed?}
     ERR -->|software| OK2[rendering resumes on the new fd]
     ERR -->|femtovg| FATAL[rebuild unsupported: error ends the event loop]
+```
 
 Rules that hold everywhere:
 

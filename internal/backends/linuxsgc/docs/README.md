@@ -40,6 +40,7 @@ The rest of this directory explains each piece:
 
 ## Component map
 
+```mermaid
 graph TD
     APP["slint app<br/>(enables slint features)"] --> SEL["backend selector<br/>SLINT_BACKEND=linuxsgc"]
     SEL --> BE["Backend<br/>(calloop_backend/mod.rs)"]
@@ -55,6 +56,7 @@ graph TD
     LI --> ADAPTER
     SESS -->|"granted fds (SCM_RIGHTS)"| INPUT
     SESS -->|"lease fd dup"| OUT
+```
 
 ## Quick start
 

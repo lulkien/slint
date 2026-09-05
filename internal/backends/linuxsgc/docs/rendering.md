@@ -58,6 +58,7 @@ negotiated format is the first the renderer and the display both support.
 
 Frame pipeline:
 
+```mermaid
 flowchart TD
     RIF["render_if_needed<br/>(redraw requested, not suspended)"] --> MAP["map_back_buffer: lock the next buffer"]
     MAP --> ROT["SoftwareRenderer.set_rendering_rotation(rotation)"]
@@ -67,6 +68,7 @@ flowchart TD
     CUR -->|no| PRES
     BLIT --> PRES["present (page flip)"]
     PRES --> FLIP["wait_for_page_flip on the next frame"]
+```
 
 - `render()` paints the whole scene every frame; buffer age selects the
   repaint-buffer strategy (`NewBuffer` first frame, then reused/swapped).
@@ -92,6 +94,7 @@ Preemption costs one frozen frame and a rebuild — the process survives.
 The GL path uses a **gbm display** on the lease fd, an EGL display and a
 GLES2 (fallback: any) context, and a gbm-backed window surface:
 
+```mermaid
 flowchart TD
     NEW["FemtoVGRendererAdapter::new(accessor)"] --> OUT["DrmOutput::new(accessor)<br/>connector + mode (same selection as sw)"]
     OUT --> GBM["GbmDisplay::new: gbm device on the lease fd<br/>gbm surface + EGL window"]
@@ -101,6 +104,7 @@ flowchart TD
     RCTX --> CB["post-render callback: draws the cursor<br/>in logical space under the scene transform"]
     CB --> PRES2["present (gbm buffer swap + page flip)"]
     PRES2 --> WAIT["wait_for_page_flip first (previous frame posted)"]
+```
 
 The scene is rendered rotated by the GL transform (`rotation.degrees()` +
 `translation_after_rotation(size)`); the cursor is drawn through the same

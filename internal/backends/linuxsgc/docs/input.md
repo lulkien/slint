@@ -36,6 +36,7 @@ yields the genuine path).
 
 ## Registration (startup)
 
+```mermaid
 sequenceDiagram
     participant B as Backend::build
     participant R as InputRegistry
@@ -51,6 +52,7 @@ sequenceDiagram
     Note over L: libinput probes capabilities off that fd
     L-->>B: Device handle stored in the registry entry
     B->>B: "linuxsgc: input: libinput device added: ..."
+```
 
 `path_add_device` happens on the event-loop thread at loop start, never at
 build time: libinput is not thread-safe and the add opens the device
@@ -58,6 +60,7 @@ synchronously through the interface.
 
 ## State layout
 
+```mermaid
 graph TD
     R["InputState (Rc, created at build)"] --> CTX["libinput context<br/>(new_from_path)"]
     R --> REG["InputRegistry<br/>Rc&lt;RefCell&lt;Vec&lt;GrantedInput&gt;&gt;&gt;"]
@@ -65,6 +68,7 @@ graph TD
     HANDLER["LibInputHandler"] -->|"context clone<br/>(libinput is refcounted)"| CTX
     PUMP["sgc pump routing (on_sgc_event)"] -->|"context clone"| CTX
     PUMP --> REG
+```
 
 One `GrantedInput` per device:
 
@@ -130,6 +134,7 @@ Input resources follow the daemon's policy exactly like DRM (FairQueue by
 default): a second client acquiring a held input causes a revoke, and when
 the preempting client leaves, the queued owner is re-granted.
 
+```mermaid
 sequenceDiagram
     participant D as daemon
     participant P as pump (on_sgc_event)
@@ -144,3 +149,4 @@ sequenceDiagram
     P->>R: on_granted: add_granted (dup + readlink of the fresh fd)
     P->>L: path_add_device again (same real path)
     Note over P,R: rendering and all other devices keep working throughout
+```
