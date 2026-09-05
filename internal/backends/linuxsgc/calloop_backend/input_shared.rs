@@ -258,6 +258,41 @@ impl InputState {
         }
         added
     }
+
+    /// Handle a live re-grant of an `Input` resource (the daemon re-granted
+    /// a device after a revoke): register the fresh fd and hand the device
+    /// to libinput. Runs on the event-loop thread (the sgc pump callback);
+    /// a failure logs and the grant is dropped — never fatal.
+    pub fn on_granted(&self, resource: Resource, fd: OwnedFd) {
+        self.registry.add_granted(resource, fd);
+        self.add_pending_devices();
+    }
+
+    /// Handle a live revoke of an `Input` resource: remove the device from
+    /// libinput and drop the grant (the registry dup — the client already
+    /// dropped its canonical). Runs on the event-loop thread.
+    pub fn on_revoked(&self, resource: &Resource) {
+        // Take the entry out first (device handle included) so the libinput
+        // call below runs with no registry borrow alive.
+        let removed = {
+            let mut devices = self.registry.0.borrow_mut();
+            match devices.iter().position(|granted| &granted.resource == resource) {
+                Some(index) => devices.remove(index),
+                None => {
+                    eprintln!(
+                        "linuxsgc: input: {resource:?} revoked but never registered — ignoring"
+                    );
+                    return;
+                }
+            }
+        };
+        if let Some(device) = removed.device {
+            // path_remove_device is the counterpart of the add: dropping the
+            // entry without it would leak the device in libinput.
+            self.libinput.clone().path_remove_device(device);
+        }
+        println!("linuxsgc: input: {resource:?} revoked — device removed from libinput");
+    }
 }
 
 /// Apply the open(2) flags libinput asked for to a dup of a granted fd.

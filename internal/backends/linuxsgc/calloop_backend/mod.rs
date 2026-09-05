@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use calloop::EventLoop;
 use i_slint_core::platform::PlatformError;
-use libsgc_rs::SgcEvent;
+use libsgc_rs::{Resource, SgcEvent};
 
 use crate::fullscreenwindowadapter::FullscreenWindowAdapter;
 use crate::sgc::SgcSession;
@@ -88,6 +88,12 @@ struct SharedState {
     /// While set, the window adapter skips rendering (lease revoked, pending
     /// re-grant). Shared with the adapter.
     suspended: Rc<Cell<bool>>,
+    /// The input side of the session: the shared libinput path context over
+    /// the granted devices. The pump routes input grant/revoke events here
+    /// (devices are added/removed on this thread). Featureless builds hold
+    /// no input resources, so they never see an input event.
+    #[cfg(feature = "libinput")]
+    input_state: Rc<input_shared::InputState>,
 }
 
 /// Device opener that hands out the current sgc lease fd and refuses anything
@@ -128,10 +134,23 @@ impl SharedState {
         })
     }
 
-    /// Apply one sgc event to the render state.
+    /// Apply one sgc event: DRM events drive suspend/rebuild of the display
+    /// stack, input events add/remove devices in the shared libinput
+    /// context. Routing is strict by resource kind — an input event never
+    /// touches the drm fd slot and vice versa.
     fn on_sgc_event(&self, event: SgcEvent) -> Result<(), PlatformError> {
         match event {
-            SgcEvent::Revoked { resource } => {
+            SgcEvent::Revoked { resource: resource @ Resource::Drm { card } } => {
+                // This backend holds exactly one card; a revoke naming
+                // another card is a protocol anomaly and must not suspend a
+                // display stack we still own.
+                if card != self.card {
+                    eprintln!(
+                        "linuxsgc: ignoring revoke of {resource:?} — this backend holds Drm{{ card: {} }}",
+                        self.card
+                    );
+                    return Ok(());
+                }
                 // The library already sent the Release revoke-ack; the daemon
                 // requeues us. Drop the fd slot and stop rendering: the old
                 // display stack died with the lease and must not be touched.
@@ -139,7 +158,14 @@ impl SharedState {
                 self.suspended.set(true);
                 *self.drm_fd.borrow_mut() = None;
             }
-            SgcEvent::Granted { resource, fd } => {
+            SgcEvent::Granted { resource: resource @ Resource::Drm { card }, fd } => {
+                if card != self.card {
+                    eprintln!(
+                        "linuxsgc: ignoring grant of {resource:?} — this backend holds Drm{{ card: {} }}",
+                        self.card
+                    );
+                    return Ok(());
+                }
                 println!(
                     "linuxsgc: lease {resource:?} re-granted (fd {}) — rebuilding display stack",
                     fd.as_raw_fd()
@@ -155,6 +181,21 @@ impl SharedState {
                     adapter.rebuild_renderer(&accessor)?;
                 }
                 self.suspended.set(false);
+            }
+            // Input resources: add/remove the device in the shared libinput
+            // context. Both run on the event-loop thread (pump callback).
+            // Featureless builds acquire no input resources, so an input
+            // event can never name one they hold.
+            #[cfg(feature = "libinput")]
+            SgcEvent::Revoked { resource: resource @ Resource::Input(_) } => {
+                self.input_state.on_revoked(&resource);
+            }
+            #[cfg(feature = "libinput")]
+            SgcEvent::Granted { resource: resource @ Resource::Input(_), fd } => {
+                self.input_state.on_granted(resource, fd);
+            }
+            other => {
+                eprintln!("linuxsgc: ignoring {other:?} — not a resource this backend holds");
             }
         }
         Ok(())
@@ -244,6 +285,8 @@ impl Backend {
                 drm_fd: Rc::new(RefCell::new(Some(fd))),
                 card,
                 suspended: Rc::new(Cell::new(false)),
+                #[cfg(feature = "libinput")]
+                input_state: input_state.clone(),
             }),
             sgc_session: Rc::new(session),
             user_event_receiver: RefCell::new(Some(user_event_receiver)),
