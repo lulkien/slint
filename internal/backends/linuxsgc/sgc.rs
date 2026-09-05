@@ -125,11 +125,12 @@ impl SgcSession {
         self.client.borrow_mut().pump(Some(Duration::ZERO)).map_err(sgc_err)
     }
 
-    /// A fresh dup of the currently held lease fd (owned by the caller). Used
-    /// at startup to seed the display stack; re-grants arrive as
-    /// [`SgcEvent::Granted`] fds through [`SgcSession::pump`].
-    pub fn fd(&self) -> Result<OwnedFd, PlatformError> {
-        self.client.borrow().fd(&self.resource).map_err(sgc_err)
+    /// A fresh dup of the currently held fd for `resource` (owned by the
+    /// caller). Used at startup to seed the display stack (`Drm`) and the
+    /// input registry (`Input(_)`); re-grants arrive as [`SgcEvent::Granted`]
+    /// fds through [`SgcSession::pump`].
+    pub fn fd(&self, resource: &Resource) -> Result<OwnedFd, PlatformError> {
+        self.client.borrow().fd(resource).map_err(sgc_err)
     }
 }
 

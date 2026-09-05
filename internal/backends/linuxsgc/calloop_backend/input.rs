@@ -2,13 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
 // cSpell: ignore keystate Keysym RDONLY RDWR
-//! This module contains the code to receive input events from libinput
+//! This module contains the code to receive input events from libinput. The
+//! devices come from the @sgc daemon (grants, see `input_shared`); this
+//! module only owns a handle of the shared path context and dispatches the
+//! events to the window.
 
 use std::cell::RefCell;
-use std::fs::{File, OpenOptions};
-use std::os::fd::OwnedFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
 use std::pin::Pin;
 use std::rc::Rc;
 
@@ -17,47 +16,16 @@ use i_slint_core::lengths::logical_point_from_api;
 use i_slint_core::platform::{PlatformError, PointerEventButton, WindowEvent};
 use i_slint_core::window::{WindowAdapter, WindowInner};
 use i_slint_core::{Property, SharedString};
-use input::LibinputInterface;
 use input::event::keyboard::{KeyState, KeyboardEventTrait};
 use input::event::touch::{TouchEventPosition, TouchEventSlot};
 use xkbcommon::*;
 
+use super::input_shared::InputState;
 use crate::fullscreenwindowadapter::FullscreenWindowAdapter;
 
-struct DirectDeviceAccess {}
-
-impl DirectDeviceAccess {
-    #[allow(clippy::new_ret_no_self)]
-    pub fn new() -> input::Libinput {
-        let mut libinput = input::Libinput::new_with_udev(Self {});
-        libinput.udev_assign_seat("seat0").unwrap();
-        libinput
-    }
-}
-
-impl LibinputInterface for DirectDeviceAccess {
-    fn open_restricted(&mut self, path: &Path, flags_raw: i32) -> Result<OwnedFd, i32> {
-        let flags = nix::fcntl::OFlag::from_bits_retain(flags_raw);
-        OpenOptions::new()
-            .custom_flags(flags_raw)
-            .read(
-                flags.contains(nix::fcntl::OFlag::O_RDONLY)
-                    | flags.contains(nix::fcntl::OFlag::O_RDWR),
-            )
-            .write(
-                flags.contains(nix::fcntl::OFlag::O_WRONLY)
-                    | flags.contains(nix::fcntl::OFlag::O_RDWR),
-            )
-            .open(path)
-            .map(|file| file.into())
-            .map_err(|err| err.raw_os_error().unwrap())
-    }
-    fn close_restricted(&mut self, fd: OwnedFd) {
-        drop(File::from(fd));
-    }
-}
-
 pub struct LibInputHandler<'a> {
+    /// Our handle of the shared libinput path context (a clone — the
+    /// original lives in the [`InputState`]).
     libinput: input::Libinput,
     token: Option<calloop::Token>,
     mouse_pos: Pin<Rc<Property<Option<LogicalPosition>>>>,
@@ -77,8 +45,16 @@ impl<'a> LibInputHandler<'a> {
         window: &'a RefCell<Option<Rc<FullscreenWindowAdapter>>>,
         event_loop_handle: &calloop::LoopHandle<'a, T>,
         libinput_event_hook: &'a Option<Box<dyn Fn(&::input::Event) -> bool>>,
+        input_state: Rc<InputState>,
     ) -> Result<Pin<Rc<Property<Option<LogicalPosition>>>>, PlatformError> {
-        let libinput = DirectDeviceAccess::new();
+        // Hand the session's granted devices to libinput. This runs here, on
+        // the event-loop thread: libinput is not thread-safe and adding a
+        // device opens it synchronously through the interface. (Later grants
+        // and revokes arrive through the sgc pump and add/remove devices the
+        // same way, on this thread.)
+        input_state.add_pending_devices();
+
+        let libinput = input_state.libinput();
 
         let mouse_pos_property = Rc::pin(Property::new(None));
 

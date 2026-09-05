@@ -25,6 +25,8 @@ use crate::sgc::SgcSession;
 
 #[cfg(feature = "libinput")]
 mod input;
+#[cfg(feature = "libinput")]
+mod input_shared;
 
 /// How often the sgc socket is pumped (non-blocking poll). Far inside the
 /// daemon's 5s revoke/ack grace period; cheap enough to run always.
@@ -193,6 +195,11 @@ pub struct Backend {
     clipboard: RefCell<Option<String>>,
     #[cfg(feature = "libinput")]
     libinput_event_hook: Option<Box<dyn Fn(&::input::Event) -> bool>>,
+    /// The input side of the sgc session: the libinput path context over the
+    /// daemon-granted devices (created at `build`, seeded from the session's
+    /// acquired inputs, consumed by the libinput dispatch source).
+    #[cfg(feature = "libinput")]
+    input_state: Rc<input_shared::InputState>,
 }
 
 impl Backend {
@@ -218,7 +225,18 @@ impl Backend {
         // missing/denying daemon fails the app at startup with a clear error.
         let session = SgcSession::connect_and_acquire()?;
         let card = session.card;
-        let fd = Rc::new(session.fd()?);
+        let fd = Rc::new(session.fd(&session.resource)?);
+
+        // The input side of the session: a libinput path context over every
+        // granted input device. Devices are duped and resolved to their
+        // /dev/input paths here (no libinput interaction yet); libinput only
+        // sees them at run_event_loop start, on the loop thread.
+        #[cfg(feature = "libinput")]
+        let input_state = {
+            let input_state = input_shared::InputState::new();
+            input_state.seed_from_session(&session);
+            input_state
+        };
 
         Ok(Backend {
             shared: Rc::new(SharedState {
@@ -237,6 +255,8 @@ impl Backend {
             clipboard: Default::default(),
             #[cfg(feature = "libinput")]
             libinput_event_hook: builder.libinput_event_hook,
+            #[cfg(feature = "libinput")]
+            input_state,
         })
     }
 }
@@ -285,6 +305,7 @@ impl i_slint_core::platform::Platform for Backend {
             &self.shared.window,
             &event_loop.handle(),
             &self.libinput_event_hook,
+            self.input_state.clone(),
         )?;
 
         // Without libinput there is no pointer to track, so the cursor property
