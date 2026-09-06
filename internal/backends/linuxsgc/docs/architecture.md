@@ -27,15 +27,17 @@ between these — `RefCell`/`Rc` only.
 graph TD
     BE["Backend"] --> SH["Rc&lt;SharedState&gt;"]
     BE --> SES["Rc&lt;SgcSession&gt;"]
-    BE --> ISP["Rc&lt;InputState&gt; (feature libinput)"]
+    BE --> IS["Rc&lt;InputState&gt;<br/>(feature libinput)"]
+    SH --> IS
     SH --> W["RefCell&lt;Option&lt;Rc&lt;FullscreenWindowAdapter&gt;&gt;&gt;"]
     SH --> DF["Rc&lt;RefCell&lt;Option&lt;Rc&lt;OwnedFd&gt;&gt;&gt;&gt;<br/>the drm fd slot"]
     SH --> SUS["Rc&lt;Cell&lt;bool&gt;&gt; suspended"]
-    SH --> IS2["Rc&lt;InputState&gt; (feature libinput)"]
-    ISP --> CTX["input::Libinput context<br/>(clones shared)"]
-    IS2 --> CTX
-    CTX --> IFACE["InputRegistry (the LibinputInterface)"]
-    SES --> CLIENT["SgcClient (canonical fds)"]
+    IS --> REG["InputRegistry<br/>(granted-device table)"]
+    IS --> CTX["input::Libinput path context"]
+    CTX -. "uses a registry clone as its LibinputInterface" .-> REG
+    LI["LibInputHandler (input.rs)"] -. "own refcounted handle" .-> CTX
+    LI -. "borrows" .-> W
+    SES --> CLIENT["SgcClient"]
 ```
 
 Notes:
