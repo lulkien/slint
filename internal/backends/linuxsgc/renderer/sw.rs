@@ -7,7 +7,7 @@ use i_slint_core::platform::PlatformError;
 use i_slint_core::renderer::DrawOutcome;
 pub use i_slint_renderer_software::SoftwareRenderer;
 use i_slint_renderer_software::{PremultipliedRgbaColor, RepaintBufferType, TargetPixel};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::display::RenderingRotation;
 
@@ -15,8 +15,8 @@ pub struct SoftwareRendererAdapter {
     renderer: SoftwareRenderer,
     /// fd-bound display stack; rebuilt on lease re-grant (the SoftwareRenderer
     /// itself is fd-independent and survives a rebuild).
-    display: std::cell::RefCell<Option<Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>>>,
-    presenter: std::cell::RefCell<Option<Arc<dyn crate::display::Presenter>>>,
+    display: std::cell::RefCell<Option<Rc<dyn crate::display::swdisplay::SoftwareBufferDisplay>>>,
+    presenter: std::cell::RefCell<Option<Rc<dyn crate::display::Presenter>>>,
     size: std::cell::Cell<i_slint_core::api::PhysicalSize>,
 }
 
@@ -190,7 +190,7 @@ impl SoftwareRendererAdapter {
 
     fn current_display(
         &self,
-    ) -> std::cell::Ref<'_, Arc<dyn crate::display::swdisplay::SoftwareBufferDisplay>> {
+    ) -> std::cell::Ref<'_, Rc<dyn crate::display::swdisplay::SoftwareBufferDisplay>> {
         std::cell::Ref::map(self.display.borrow(), |d| d.as_ref().expect("display initialized"))
     }
 }

@@ -3,7 +3,7 @@
 
 // cSpell: ignore Uyvy Vyuy Xbgr Yuyv Yvyu
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crate::drmoutput::DrmOutput;
 use drm::control::Device;
@@ -20,11 +20,11 @@ pub struct DumbBufferDisplay {
 }
 
 impl DumbBufferDisplay {
-    #[allow(clippy::new_ret_no_self, clippy::arc_with_non_send_sync)]
+    #[allow(clippy::new_ret_no_self)]
     pub fn new(
         device_opener: &crate::DeviceOpener,
         renderer_formats: &[drm::buffer::DrmFourcc],
-    ) -> Result<Arc<dyn super::SoftwareBufferDisplay>, PlatformError> {
+    ) -> Result<Rc<dyn super::SoftwareBufferDisplay>, PlatformError> {
         let drm_output = DrmOutput::new(device_opener)?;
 
         let available_formats = drm_output.get_supported_formats()?;
@@ -59,7 +59,7 @@ impl DumbBufferDisplay {
         )?
         .into();
 
-        Ok(Arc::new(Self { drm_output, front_buffer, back_buffer, in_flight_buffer }))
+        Ok(Rc::new(Self { drm_output, front_buffer, back_buffer, in_flight_buffer }))
     }
 }
 
@@ -86,7 +86,7 @@ impl super::SoftwareBufferDisplay for DumbBufferDisplay {
             .and_then(|mut buffer| callback(buffer.as_mut(), age, format))
     }
 
-    fn as_presenter(self: Arc<Self>) -> Arc<dyn crate::display::Presenter> {
+    fn as_presenter(self: Rc<Self>) -> Rc<dyn crate::display::Presenter> {
         self
     }
 }
