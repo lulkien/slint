@@ -17,7 +17,7 @@ use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use i_slint_core::platform::PlatformError;
-use libsgc_rs::{Resource, SgcClient, SgcError, SgcEvent};
+use libsgc_rs::{InputResource, Resource, SgcClient, SgcError, SgcEvent};
 
 /// The acquired session: a live client plus the resources we hold — the DRM
 /// card lease we render on and, with the `libinput` feature, the input
@@ -77,25 +77,46 @@ impl SgcSession {
         // Input devices ride along with the lease when input support is
         // compiled in (feature `libinput`): acquire every advertised one so
         // the window can later receive pointer/keyboard/touch events on the
-        // granted fds. Best-effort — a failed acquire must not kill the UI;
-        // log it and continue without the device. Without the feature the
-        // session holds only the lease: devices it cannot consume must stay
-        // available to other clients.
+        // granted fds. Best-effort — a failed acquire must not kill the UI
+        // (a keyboard-less app is still usable), but a DENIAL is permanent for
+        // this process: the daemon keeps no memory of the request and the
+        // protocol has no "tell me when it is free", so nothing re-asks for
+        // us. That is worth saying out loud — the alternative is a kiosk that
+        // silently has no keyboard. Without the feature the session holds only
+        // the lease: devices it cannot consume must stay available to other
+        // clients.
         #[cfg(feature = "libinput")]
         let inputs = {
             let mut inputs = Vec::new();
             for input in &advertised {
-                if !matches!(input, Resource::Input(_)) {
+                let Resource::Input(input_resource) = input else {
                     continue;
-                }
+                };
+                // What the device feeds the app, for the messages below.
+                let kind = match input_resource {
+                    InputResource::Mouse(_) => "pointer",
+                    InputResource::Keyboard(_) => "keyboard",
+                    InputResource::Touch(_) => "touch",
+                };
                 println!("linuxsgc: acquiring {input:?} from @sgc...");
                 match client.acquire(input.clone()) {
                     Ok(()) => {
                         println!("linuxsgc: {input:?} granted");
                         inputs.push(input.clone());
                     }
+                    // Someone else holds it and the daemon's policy for that
+                    // resource is non-preemptive (first-owner): a newcomer is
+                    // denied instead of taking it over.
+                    Err(SgcError::Denied { reason }) => eprintln!(
+                        "linuxsgc: cannot take {input:?} — the daemon denied it ({reason}). \
+                         This app will receive no {kind} events for its whole lifetime: another \
+                         client holds the device and the daemon's policy is first-owner, which \
+                         denies a newcomer rather than preempting the holder. Restart this app \
+                         once that client releases the device, or run @sgc with its default \
+                         fair-queue policy, where a newcomer preempts the holder instead"
+                    ),
                     Err(err) => eprintln!(
-                        "linuxsgc: acquire of {input:?} failed — continuing without it: {err}"
+                        "linuxsgc: cannot take {input:?} — {err}. This app will receive no {kind} events"
                     ),
                 }
             }

@@ -129,6 +129,27 @@ the event loop — a useful end-to-end test signal on the board.
 An optional `libinput_event_hook` (backend builder, feature `libinput`) can
 filter/consume raw events before dispatch.
 
+## A denied input is permanent
+
+Inputs are acquired once, at `connect_and_acquire`, and a refusal is not retried
+— the daemon keeps no memory of the request and the protocol has no "tell me when
+it is free". So a denial is a fact for the app's whole lifetime, and the log says
+so, naming the device kind the app will be missing and what to do about it:
+
+    linuxsgc: cannot take Input(Keyboard(0)) — the daemon denied it (held by another client).
+    This app will receive no keyboard events for its whole lifetime: another client holds the
+    device and the daemon's policy is first-owner, which denies a newcomer rather than preempting
+    the holder. Restart this app once that client releases the device, or run @sgc with its
+    default fair-queue policy, where a newcomer preempts the holder instead
+
+Under the default `fair-queue` (and `latest-owner`) this cannot happen: a newcomer
+preempts the owner and the acquire succeeds. The case is `first-owner` — the
+kiosk policy — where denial is the intended behaviour and the app must be
+restarted to pick the device up after the holder leaves. Retrying the acquire is
+deliberately NOT done: under a preemptive policy an acquire steals the device, so
+an automatic retry would be a retry-steal, and today's policies only deny when
+they also never preempt.
+
 ## Live revoke / re-grant (preemption)
 
 Input resources follow the daemon's policy exactly like DRM (FairQueue by
