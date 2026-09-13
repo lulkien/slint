@@ -1,12 +1,12 @@
 // Copyright © SixtyFPS GmbH <info@slint.dev>
 // SPDX-License-Identifier: GPL-3.0-only OR LicenseRef-Slint-Royalty-free-2.0 OR LicenseRef-Slint-Software-3.0
 
-use std::{num::NonZeroU32, rc::Rc};
+use std::{cell::Cell, cell::RefCell, num::NonZeroU32, rc::Rc};
 
 use i_slint_core::item_rendering::ItemRenderer;
 use i_slint_core::platform::PlatformError;
 use i_slint_core::renderer::DrawOutcome;
-use i_slint_renderer_femtovg::FemtoVGRendererExt;
+use i_slint_renderer_femtovg::{FemtoVGOpenGLRendererExt, FemtoVGRendererExt};
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use glutin::{
@@ -22,8 +22,12 @@ use crate::drmoutput::DrmOutput;
 pub struct FemtoVGRendererAdapter {
     renderer:
         i_slint_renderer_femtovg::FemtoVGRenderer<i_slint_renderer_femtovg::opengl::OpenGLBackend>,
-    gbm_display: Rc<GbmDisplay>,
-    size: i_slint_core::api::PhysicalSize,
+    // sgc fork: both are replaced when a re-granted lease moves the display stack
+    // to a new fd. The renderer object itself stays where it is (the OpenGL
+    // interface and the canvas live inside it), because the core keeps a
+    // `&dyn Renderer` to it for the lifetime of the window.
+    gbm_display: RefCell<Rc<GbmDisplay>>,
+    size: Cell<i_slint_core::api::PhysicalSize>,
 }
 
 struct GlContextWrapper {
@@ -171,8 +175,8 @@ impl FemtoVGRendererAdapter {
             renderer: i_slint_renderer_femtovg::FemtoVGRenderer::new(GlContextWrapper::new(
                 &egl_display,
             )?)?,
-            gbm_display: egl_display,
-            size,
+            gbm_display: RefCell::new(egl_display),
+            size: Cell::new(size),
         });
 
         eprintln!("Using FemtoVG OpenGL renderer");
@@ -192,20 +196,56 @@ impl crate::fullscreenwindowadapter::FullscreenRenderer for FemtoVGRendererAdapt
         _mouse_position: Option<i_slint_core::api::PhysicalPosition>,
         draw_mouse_cursor_callback: &dyn Fn(&mut dyn ItemRenderer),
     ) -> Result<DrawOutcome, PlatformError> {
+        let size = self.size.get();
         let outcome = self.renderer.render_transformed_with_post_callback(
             rotation.degrees(),
-            rotation.translation_after_rotation(self.size),
-            self.size,
+            rotation.translation_after_rotation(size),
+            size,
             Some(&|item_renderer| {
                 draw_mouse_cursor_callback(item_renderer);
             }),
         )?;
         if matches!(outcome, DrawOutcome::Success) {
-            self.gbm_display.present()?;
+            self.gbm_display.borrow().present()?;
         }
         Ok(outcome)
     }
     fn size(&self) -> i_slint_core::api::PhysicalSize {
-        self.size
+        self.size.get()
+    }
+
+    /// sgc fork: rebuild the display stack on the lease the daemon just granted.
+    ///
+    /// The EGL context, its surface and the GBM device were all created from the
+    /// revoked lease fd, and EGL cannot re-home a live context onto another
+    /// device. So the femtovg canvas and the GL caches are dropped first - while
+    /// the old context is still current, which is what `clear_graphics_context`
+    /// needs - and a fresh stack is then built from the re-granted lease and
+    /// handed to the same renderer object.
+    ///
+    /// The next frame creates a new femtovg canvas, so it re-uploads the glyph
+    /// atlas and every texture. That frame has to cover the whole window, which is
+    /// what `rebuild_renderer` asks for after this returns.
+    fn rebuild(&self, device_opener: &crate::DeviceOpener) -> Result<(), PlatformError> {
+        // Best effort: a revoked device may refuse to make its context current
+        // again. Leaking the old canvas is better than refusing to resume, and the
+        // caches below are dropped regardless.
+        if let Err(err) = self.renderer.clear_graphics_context() {
+            eprintln!("linuxsgc: tearing down the revoked GL context failed: {err}");
+        }
+
+        let drm_output = DrmOutput::new(device_opener)?;
+        let gbm_display = Rc::new(crate::display::gbmdisplay::GbmDisplay::new(drm_output)?);
+        let (width, height) = gbm_display.drm_output.size();
+
+        self.renderer.set_opengl_context(GlContextWrapper::new(&gbm_display)?)?;
+
+        // Only now is it safe to drop the old stack: the new context owns the new
+        // GBM device, and the revoked one is released with the old Rc.
+        *self.gbm_display.borrow_mut() = gbm_display;
+        self.size.set(i_slint_core::api::PhysicalSize::new(width, height));
+
+        println!("linuxsgc: display stack rebuilt on the re-granted lease ({width}x{height})");
+        Ok(())
     }
 }
