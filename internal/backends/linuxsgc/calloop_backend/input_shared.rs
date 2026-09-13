@@ -59,6 +59,10 @@ pub struct GrantedInput {
     /// the device can be removed again on revoke — dropping the entry
     /// without `path_remove_device` would leak the device in libinput.
     device: Option<input::Device>,
+    /// Set once a `path_add_device` attempt for this entry was rejected. The
+    /// pump retries pending entries every 50 ms, so the rejection is logged
+    /// once per grant instead of 20 times a second.
+    add_failed: bool,
 }
 
 /// The granted-device table, shared between the libinput interface (which
@@ -107,7 +111,7 @@ impl InputRegistry {
             return;
         }
         println!("linuxsgc: input: registered granted {resource:?}: {}", path.display());
-        devices.push(GrantedInput { resource, fd, path, device: None });
+        devices.push(GrantedInput { resource, fd, path, device: None, add_failed: false });
     }
 
     /// The granted device libinput asked to open, found by path.
@@ -140,6 +144,23 @@ impl InputRegistry {
                 None
             }
             None => Some(device),
+        }
+    }
+
+    /// Record that libinput rejected the `path_add_device` for `path`.
+    /// Returns true when this is the entry's FIRST rejection, i.e. when the
+    /// caller should log it: the pump retries pending entries every 50 ms, so
+    /// an unconditional log would flood the journal. False for an entry that
+    /// is gone (revoked while the add was in flight) or already noted.
+    fn note_add_failure(&self, path: &Path) -> bool {
+        let mut devices = self.0.borrow_mut();
+        match devices.iter_mut().find(|granted| granted.path.as_path() == path) {
+            Some(granted) => {
+                let first = !granted.add_failed;
+                granted.add_failed = true;
+                first
+            }
+            None => false,
         }
     }
 }
@@ -250,10 +271,18 @@ impl InputState {
                         }
                     }
                 }
-                None => eprintln!(
-                    "linuxsgc: input: libinput rejected {resource:?} at {} — keeping the grant registered",
-                    path.display()
-                ),
+                None => {
+                    // Not fatal and not necessarily permanent: libinput may
+                    // still be finishing the removal of this path. Keep the
+                    // entry so the pump's retry picks it up, and log the first
+                    // rejection only.
+                    if self.registry.note_add_failure(&path) {
+                        eprintln!(
+                            "linuxsgc: input: libinput rejected {resource:?} at {} — keeping the grant registered for the next retry",
+                            path.display()
+                        );
+                    }
+                }
             }
         }
         added

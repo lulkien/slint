@@ -209,7 +209,17 @@ fn pump_sgc(shared: &SharedState, session: &SgcSession) -> Result<(), PlatformEr
     loop {
         match session.pump()? {
             Some(event) => shared.on_sgc_event(event)?,
-            None => return Ok(()),
+            None => {
+                // Retry input devices libinput has not accepted yet. A re-grant
+                // can name a path libinput has not finished removing (its
+                // removal is asynchronous), and `path_add_device` returning
+                // None only leaves the entry pending — so without this the
+                // device would stay dead for the process's lifetime. Idempotent
+                // and cheap: it does nothing while no entry is pending.
+                #[cfg(feature = "libinput")]
+                shared.input_state.add_pending_devices();
+                return Ok(());
+            }
         }
     }
 }
