@@ -117,7 +117,8 @@ the libinput fd (a clone of the context). When readable it calls
 | pointer button | `PointerPressed/Released` (BTN mapping left/right/middle/back/forward) |
 | touch down/up/motion/cancel | `process_touch_input` per slot (up to 5 slots tracked; touch-up carries no position, so the last position per slot is replayed) |
 | keyboard key | xkb: lazy `Keymap::new_from_names` (empty names = xkbcommon defaults, needs XKB data files on the target), key state kept in an `xkb::State`; `KeyPressed/Released` with the mapped text |
-| everything else | ignored (device add/remove events, etc. — device lifecycle is driven explicitly) |
+| device removed | the device was taken by the kernel (unplug, or a udev trigger re-created its node): drop the registry entry; see below |
+| everything else | ignored (device ADDED and the rest — we only ever hand libinput what we granted, so its own add is redundant and the lifecycle stays explicit) |
 
 Mouse motion/position lives in a shared `mouse_position` property that
 `render_if_needed` consumes to draw the cursor (see rendering.md).
@@ -150,3 +151,36 @@ sequenceDiagram
     P->>L: path_add_device again (same real path)
     Note over P,R: rendering and all other devices keep working throughout
 ```
+
+## Held keys and touches need no reset
+
+Nothing in the backend resets the xkb state or the touch slots when a device
+goes away, because libinput already does the part that matters: removing a device
+releases the keys it held, so the xkb state cannot keep a modifier down, and it
+cancels its touches, so no slot is left replaying a position for a device that is
+gone. Verified on the board against the pre-change binary: with Ctrl and Alt held
+down through a steal/re-grant cycle, a later plain Backspace stayed a plain
+Backspace — while the same process still quit on the full Ctrl+Alt+Backspace
+chord, so the chord path itself was healthy, not merely dead input.
+
+An explicit reset would be worse than nothing: xkb keeps ONE state for all
+keyboards, so clearing it because one keyboard went away would drop a modifier
+legitimately held on another one.
+
+## A device the kernel takes away
+
+An unplug — or a udev trigger, which installing anything with udev rules runs —
+removes or re-creates `/dev/input/eventN` under the running daemon. The daemon
+never reads an input device, so it cannot notice and keeps the fd it opened at
+startup: there is no @sgc event for this. libinput does notice (its dup gets
+`ENODEV`) and reports `DEVICE_REMOVED`; the backend then drops the registry entry
+(libinput already removed the device, so there is no `path_remove_device` to
+make), which is the one thing nothing else does — without it, a later revoke for
+that resource would try to remove a device libinput no longer knows:
+
+    linuxsgc: input: Input(Keyboard(0)) (input14) was removed by the kernel — dropping the grant;
+    restart the @sgc daemon to re-enumerate devices
+
+The resource stays unusable until the daemon re-enumerates — input has no
+hot-plug. A grant that arrives afterwards for a path the daemon still holds (the
+node it opened is gone) is skipped at registration, see `add_granted`.

@@ -31,6 +31,16 @@
 //! on both. The daemon reads nothing from the device after granting, so
 //! making it non-blocking is harmless, but never assume per-fd flag
 //! isolation.
+//!
+//! Device-scoped input state (the xkb state, the touch slots) deliberately
+//! lives in the handler ([`super::input::LibInputHandler`]), not here: nothing
+//! has to reset it when a device goes away. libinput already releases the keys
+//! and cancels the touches held by a device that disappears — verified on the
+//! board: with Ctrl+Alt held down, a steal/re-grant cycle leaves a later plain
+//! Backspace a plain Backspace (the same process still quits on the full
+//! chord, so the chord path itself is healthy). What nothing else does is drop
+//! OUR registry entry when the kernel takes the device away, which is what
+//! [`InputState::on_device_removed`] is for.
 
 use std::cell::RefCell;
 use std::os::fd::{AsRawFd, OwnedFd};
@@ -59,6 +69,10 @@ pub struct GrantedInput {
     /// the device can be removed again on revoke — dropping the entry
     /// without `path_remove_device` would leak the device in libinput.
     device: Option<input::Device>,
+    /// libinput's sysname for that device (e.g. `input14`), captured when the
+    /// device was added. It is how a removal event is matched back to this
+    /// entry.
+    sysname: Option<String>,
     /// Set once a `path_add_device` attempt for this entry was rejected. The
     /// pump retries pending entries every 50 ms, so the rejection is logged
     /// once per grant instead of 20 times a second.
@@ -124,7 +138,14 @@ impl InputRegistry {
             return;
         }
         println!("linuxsgc: input: registered granted {resource:?}: {}", path.display());
-        devices.push(GrantedInput { resource, fd, path, device: None, add_failed: false });
+        devices.push(GrantedInput {
+            resource,
+            fd,
+            path,
+            device: None,
+            sysname: None,
+            add_failed: false,
+        });
     }
 
     /// The granted device libinput asked to open, found by path.
@@ -150,14 +171,28 @@ impl InputRegistry {
     /// entry is gone (a revoke landed between snapshot and add), so the
     /// caller can remove it from libinput instead of leaking it.
     fn attach_device(&self, path: &Path, device: input::Device) -> Option<input::Device> {
+        // libinput's sysname is stable for the device's lifetime and is what a
+        // removal event carries back, so remember it here.
+        let sysname = device.sysname().to_string();
         let mut devices = self.0.borrow_mut();
         match devices.iter_mut().find(|granted| granted.path.as_path() == path) {
             Some(granted) => {
+                granted.sysname = Some(sysname);
                 granted.device = Some(device);
                 None
             }
             None => Some(device),
         }
+    }
+
+    /// Take the entry libinput just reported as removed (the kernel took the
+    /// device away: an unplug, or a udev trigger that re-created the node).
+    /// Matched by sysname; returns `None` when the device is not one of ours.
+    fn take_by_sysname(&self, sysname: &str) -> Option<GrantedInput> {
+        let mut devices = self.0.borrow_mut();
+        let index =
+            devices.iter().position(|granted| granted.sysname.as_deref() == Some(sysname))?;
+        Some(devices.remove(index))
     }
 
     /// Record that libinput rejected the `path_add_device` for `path`.
@@ -313,6 +348,10 @@ impl InputState {
     /// Handle a live revoke of an `Input` resource: remove the device from
     /// libinput and drop the grant (the registry dup — the client already
     /// dropped its canonical). Runs on the event-loop thread.
+    ///
+    /// Nothing else to clean up: libinput releases whatever keys the device
+    /// held while removing it, so the handler's xkb state cannot go stale (the
+    /// same goes for touches, which it cancels).
     pub fn on_revoked(&self, resource: &Resource) {
         // Take the entry out first (device handle included) so the libinput
         // call below runs with no registry borrow alive.
@@ -334,6 +373,32 @@ impl InputState {
             self.libinput.clone().path_remove_device(device);
         }
         println!("linuxsgc: input: {resource:?} revoked — device removed from libinput");
+    }
+
+    /// Handle a device libinput reports as REMOVED: the kernel took it away
+    /// (an unplug, or a udev trigger that re-created the node) while the daemon
+    /// still holds — and still considers granted — the fd it opened at startup.
+    /// No @sgc event covers this: the daemon never reads an input device, so it
+    /// cannot notice that the device died.
+    ///
+    /// Drop the entry — libinput has already removed the device, so there is no
+    /// `path_remove_device` to make here (that would be a call on a dead
+    /// handle). Without this the client keeps claiming a device that is gone:
+    /// a later revoke for the same resource would try to remove a device
+    /// libinput no longer knows. The resource itself stays unusable until the
+    /// daemon re-enumerates the devices, which is what the log line says.
+    pub fn on_device_removed(&self, device: &input::Device) {
+        let sysname = device.sysname().to_string();
+        let Some(removed) = self.registry.take_by_sysname(&sysname) else {
+            // Not a device we granted, or a second event for one already
+            // dropped (our own `path_remove_device` on a revoke reports one
+            // too — that entry is already gone).
+            return;
+        };
+        println!(
+            "linuxsgc: input: {:?} ({sysname}) was removed by the kernel — dropping the grant; restart the @sgc daemon to re-enumerate devices",
+            removed.resource
+        );
     }
 }
 

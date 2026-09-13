@@ -16,6 +16,7 @@ use i_slint_core::lengths::logical_point_from_api;
 use i_slint_core::platform::{PlatformError, PointerEventButton, WindowEvent};
 use i_slint_core::window::{WindowAdapter, WindowInner};
 use i_slint_core::{Property, SharedString};
+use input::event::EventTrait;
 use input::event::keyboard::{KeyState, KeyboardEventTrait};
 use input::event::touch::{TouchEventPosition, TouchEventSlot};
 use xkbcommon::*;
@@ -27,6 +28,10 @@ pub struct LibInputHandler<'a> {
     /// Our handle of the shared libinput path context (a clone — the
     /// original lives in the [`InputState`]).
     libinput: input::Libinput,
+    /// The shared input state. The handler uses it for one thing: a device
+    /// libinput reports as removed has to leave the granted-device registry,
+    /// and nothing else in the process can see that removal.
+    input_state: Rc<InputState>,
     token: Option<calloop::Token>,
     mouse_pos: Pin<Rc<Property<Option<LogicalPosition>>>>,
     /// Last known position per touch slot. We must track positions because
@@ -36,6 +41,10 @@ pub struct LibInputHandler<'a> {
     /// more than 5 simultaneous contacts.
     last_touch_positions: [(i32, Option<LogicalPosition>); 5],
     window: &'a RefCell<Option<Rc<FullscreenWindowAdapter>>>,
+    /// The xkb state, driven by the granted keyboards. Kept across events
+    /// because the key handler and the Ctrl+Alt+Backspace chord both read the
+    /// modifiers it tracks. It needs no explicit reset when a keyboard goes
+    /// away: libinput releases the keys it held while removing the device.
     keystate: Option<xkb::State>,
     libinput_event_hook: &'a Option<Box<dyn Fn(&::input::Event) -> bool>>,
 }
@@ -60,6 +69,7 @@ impl<'a> LibInputHandler<'a> {
 
         let handler = Self {
             libinput,
+            input_state,
             token: Default::default(),
             mouse_pos: mouse_pos_property.clone(),
             last_touch_positions: Default::default(),
@@ -285,6 +295,15 @@ impl<'a> calloop::EventSource for LibInputHandler<'a> {
                         };
                         window.try_dispatch_event(event).map_err(Self::Error::other)?;
                     }
+                }
+                input::Event::Device(input::event::DeviceEvent::Removed(removed_device)) => {
+                    // The kernel took the device away (unplugged, or a udev
+                    // trigger re-created its node) while the daemon still holds
+                    // the fd it opened at startup. Nothing on the @sgc side can
+                    // see that, so libinput is the only reporter: drop the
+                    // entry and the state it fed, instead of keeping a device
+                    // libinput no longer knows about.
+                    self.input_state.on_device_removed(&removed_device.device());
                 }
                 _ => {}
             }
