@@ -92,6 +92,19 @@ impl InputRegistry {
             );
             return;
         }
+        // A node re-created under the daemon — a udev trigger (installing
+        // anything with udev rules runs one) or a replug — leaves the resolved
+        // path carrying the kernel's " (deleted)" marker: the daemon still holds
+        // the OLD inode. libinput refuses such a path ("client bug: Invalid
+        // path") and retrying it can never succeed, so skip the device instead
+        // of registering it as pending. Input has no hot-plug: a daemon restart
+        // re-opens the current nodes.
+        if path.to_string_lossy().ends_with(" (deleted)") {
+            eprintln!(
+                "linuxsgc: input: granted {resource:?} resolves to {path:?} — the device node was re-created after the daemon opened it (stale fd); skipping it. Restart the daemon to re-enumerate the current nodes"
+            );
+            return;
+        }
 
         // O_NONBLOCK is a file-description flag: it lands on the open file
         // description shared with the daemon's fd. Harmless here — the daemon
