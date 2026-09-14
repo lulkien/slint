@@ -57,7 +57,7 @@ i-slint-renderer-software = { workspace = true, optional = true }
 # daemon (connect @sgc, acquire the card lease, pump revoke/re-grant). The
 # client library comes from crates.io: a published version resolves for every
 # consumer of this fork, git or local, with no sibling checkout needed.
-libsgc-rs = "0.1"
+libsgc-rs = "0.2"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input = { workspace = true, default-features = false, features = ["libinput_1_21"], optional = true }
