@@ -138,7 +138,17 @@ impl SharedState {
     /// stack, input events add/remove devices in the shared libinput
     /// context. Routing is strict by resource kind — an input event never
     /// touches the drm fd slot and vice versa.
-    fn on_sgc_event(&self, event: SgcEvent) -> Result<(), PlatformError> {
+    ///
+    /// The caller's `session` is needed for the two events that are
+    /// session-level rather than display state: an input revoke (the session
+    /// must forget the resource so it can be asked for again) and a display
+    /// re-grant (the app is back on screen and has to re-acquire the devices
+    /// that went with the seat).
+    fn on_sgc_event(&self, session: &SgcSession, event: SgcEvent) -> Result<(), PlatformError> {
+        // Both session-level events it serves are input events, so a build
+        // without input support has no use for the session.
+        #[cfg(not(feature = "libinput"))]
+        let _ = session;
         match event {
             SgcEvent::Revoked { resource: resource @ Resource::Drm { card } } => {
                 // This backend holds exactly one card; a revoke naming
@@ -181,6 +191,13 @@ impl SharedState {
                     adapter.rebuild_renderer(&accessor)?;
                 }
                 self.suspended.set(false);
+                // Back on screen. The devices this app held were revoked with
+                // its seat and the engine never re-grants input with the
+                // display, so ask for them again — this is the app's half of a
+                // seat handover, and without it the app comes back visible with
+                // no pointer and no keyboard.
+                #[cfg(feature = "libinput")]
+                register_inputs(self, session, session.reacquire_inputs());
             }
             // Input resources: add/remove the device in the shared libinput
             // context. Both run on the event-loop thread (pump callback).
@@ -189,6 +206,13 @@ impl SharedState {
             #[cfg(feature = "libinput")]
             SgcEvent::Revoked { resource: resource @ Resource::Input(_) } => {
                 self.input_state.on_revoked(&resource);
+                // A real revoke (the seat changed hands, or this client lost it):
+                // the resource is not ours any more, so it may be asked for
+                // again — which the display re-grant below does. A device that
+                // merely went away is SUSPENDED instead: no revoke arrives, the
+                // session keeps holding the resource, and the daemon re-grants
+                // it when the device returns.
+                session.forget_input(&resource);
             }
             #[cfg(feature = "libinput")]
             SgcEvent::Granted { resource: resource @ Resource::Input(_), fd } => {
@@ -223,7 +247,7 @@ fn pump_sgc(shared: &SharedState, session: &SgcSession) -> Result<(), PlatformEr
                     adopt_advertised_inputs(shared, session, available_resources);
                     continue;
                 }
-                shared.on_sgc_event(event)?
+                shared.on_sgc_event(session, event)?
             }
             None => {
                 // Retry input devices libinput has not accepted yet. A re-grant
@@ -249,7 +273,14 @@ fn pump_sgc(shared: &SharedState, session: &SgcSession) -> Result<(), PlatformEr
 /// `Revoked`) or libinput reports `DEVICE_REMOVED` on the holder's own fd.
 #[cfg(feature = "libinput")]
 fn adopt_advertised_inputs(shared: &SharedState, session: &SgcSession, advertised: &[Resource]) {
-    for resource in session.adopt_advertised(advertised) {
+    register_inputs(shared, session, session.adopt_advertised(advertised));
+}
+
+/// Hand freshly acquired input resources to libinput: dup each one and add it on
+/// this thread, the same path a device acquired at connect takes.
+#[cfg(feature = "libinput")]
+fn register_inputs(shared: &SharedState, session: &SgcSession, resources: Vec<Resource>) {
+    for resource in resources {
         match session.fd(&resource) {
             Ok(fd) => shared.input_state.on_granted(resource, fd),
             Err(err) => eprintln!("linuxsgc: input: cannot dup {resource:?} for libinput: {err}"),

@@ -17,7 +17,9 @@ use std::os::fd::OwnedFd;
 use std::time::Duration;
 
 use i_slint_core::platform::PlatformError;
-use libsgc_rs::{InputResource, Resource, SgcClient, SgcError, SgcEvent};
+#[cfg(feature = "libinput")]
+use libsgc_rs::InputResource;
+use libsgc_rs::{Resource, SgcClient, SgcError, SgcEvent};
 
 /// The acquired session: a live client plus the resources we hold — the DRM
 /// card lease we render on and, with the `libinput` feature, the input
@@ -124,6 +126,44 @@ impl SgcSession {
         })
     }
 
+    /// Acquire `resources` this session does not already hold, and return the
+    /// ones granted now (the caller hands each to libinput).
+    ///
+    /// `why` is the reason shown in the log: the two callers below are the two
+    /// ways a device reaches an app that is already running, and seeing which
+    /// one asked is what makes a board log readable.
+    #[cfg(feature = "libinput")]
+    fn acquire_inputs(
+        &self,
+        resources: impl IntoIterator<Item = Resource>,
+        why: &str,
+    ) -> Vec<Resource> {
+        let wanted: Vec<Resource> = resources
+            .into_iter()
+            .filter(|resource| matches!(resource, Resource::Input(_)))
+            .filter(|resource| !self.inputs.borrow().contains(resource))
+            .collect();
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+
+        let mut client = self.client.borrow_mut();
+        let mut inputs = self.inputs.borrow_mut();
+        let mut granted = Vec::new();
+        for input in wanted {
+            println!("linuxsgc: acquiring {input:?} from @sgc ({why})...");
+            match client.acquire(input.clone()) {
+                Ok(()) => {
+                    println!("linuxsgc: {input:?} granted");
+                    inputs.push(input.clone());
+                    granted.push(input);
+                }
+                Err(err) => report_input_refusal(&input, &err),
+            }
+        }
+        granted
+    }
+
     /// Adopt a resource list the daemon pushed after we connected: acquire the
     /// input devices we have not been offered before, and return the ones
     /// granted now (the caller hands them to libinput).
@@ -137,37 +177,48 @@ impl SgcSession {
     ///   and libinput reports `DEVICE_REMOVED` for a device we lose either way;
     /// - a resource that comes back on the list: we still hold it, so the daemon
     ///   re-grants it to us on its own and the acquire below skips it.
+    ///
+    /// "Not offered before" is the guard that keeps a REFUSAL from being
+    /// repeated: the daemon keeps no memory of a request and the policy that
+    /// refused one resource refuses it again, so re-asking on every push would
+    /// only refill the log. [`Self::reacquire_inputs`] deliberately breaks that
+    /// rule, and says why.
     #[cfg(feature = "libinput")]
     pub fn adopt_advertised(&self, advertised: &[Resource]) -> Vec<Resource> {
         let new: Vec<Resource> = advertised
             .iter()
-            .filter(|resource| {
-                matches!(resource, Resource::Input(_))
-                    && !self.offered.borrow().contains(resource)
-                    && !self.inputs.borrow().contains(resource)
-            })
+            .filter(|resource| !self.offered.borrow().contains(resource))
             .cloned()
             .collect();
         *self.offered.borrow_mut() = advertised.to_vec();
-        if new.is_empty() {
-            return Vec::new();
-        }
+        self.acquire_inputs(new, "appeared while running")
+    }
 
-        let mut client = self.client.borrow_mut();
-        let mut inputs = self.inputs.borrow_mut();
-        let mut granted = Vec::new();
-        for input in new {
-            println!("linuxsgc: acquiring {input:?} from @sgc (appeared while running)...");
-            match client.acquire(input.clone()) {
-                Ok(()) => {
-                    println!("linuxsgc: {input:?} granted");
-                    inputs.push(input.clone());
-                    granted.push(input);
-                }
-                Err(err) => report_input_refusal(&input, &err),
-            }
-        }
-        granted
+    /// Ask for every input device the daemon currently advertises, because this
+    /// app is BACK ON SCREEN after a preemption and the devices it held were
+    /// revoked with its seat.
+    ///
+    /// The engine re-grants the display, never the devices that went with it
+    /// (they are the client's to acquire again, in that order: asking while
+    /// holding no display is exactly what the daemon denies). This is the app's
+    /// half of a seat handover.
+    ///
+    /// It bypasses the "have I been offered this before" rule on purpose: that
+    /// rule exists to stop a refusal being repeated on every push, not to stop a
+    /// legitimate re-ask after the app lost and regained the screen — where the
+    /// device is very likely free now, and where not asking means an app that is
+    /// visible but has no pointer or keyboard.
+    #[cfg(feature = "libinput")]
+    pub fn reacquire_inputs(&self) -> Vec<Resource> {
+        self.acquire_inputs(self.offered.borrow().clone(), "the display is back")
+    }
+
+    /// Forget an input resource the daemon revoked: this app no longer holds it,
+    /// so it may be asked for again. A SUSPENDED device sends no revoke (the
+    /// holder keeps it) and therefore never lands here.
+    #[cfg(feature = "libinput")]
+    pub fn forget_input(&self, resource: &Resource) {
+        self.inputs.borrow_mut().retain(|held| held != resource);
     }
 
     /// Non-blocking protocol pump: returns one event if the server sent one,

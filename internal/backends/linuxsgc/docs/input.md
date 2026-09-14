@@ -183,30 +183,57 @@ kiosk policy — where denial is the intended behaviour and the app must be
 restarted to pick the device up after the holder leaves. Retrying the acquire is
 deliberately NOT done: under a preemptive policy an acquire steals the device, so
 an automatic retry would be a retry-steal, and today's policies only deny when
-they also never preempt.
+they also never preempt. One exception, and it is not a retry: losing and
+regaining the display re-asks for every advertised device ("The seat changes
+hands"), so a refusal lasts only as long as the app keeps the seat.
 
-## Live revoke / re-grant (preemption)
+## The seat changes hands
 
-Input resources follow the daemon's policy exactly like DRM (FairQueue by
-default): a second client acquiring a held input causes a revoke, and when
-the preempting client leaves, the queued owner is re-granted.
+Input is owned by class: the client holding the display holds the devices, and a
+client with no display may only hold one nobody else is asking for. So the
+interesting revoke is not one device being taken — it is the DISPLAY being taken,
+which revokes every device that went with it:
 
 ```mermaid
 sequenceDiagram
     participant D as daemon
     participant P as pump (on_sgc_event)
+    participant S as SgcSession
     participant R as InputRegistry
     participant L as libinput
-    D->>P: Revoked{Input(Keyboard(0))}
+    D->>P: Revoked{Drm, card: 1}
+    Note over P: lease suspended: rendering stops, the fd slot is dropped
+    D->>P: Revoked{Input(Keyboard(0))} (each device it held)
     P->>R: on_revoked: take entry out (device handle + dup)
     P->>L: path_remove_device(device) — the counterpart of the add
-    Note over P: dropping the entry without path_remove_device leaks the device
-    Note over D: preempting client holds the device...
-    D->>P: Granted{Input(Keyboard(0)), fresh fd}
-    P->>R: on_granted: add_granted (dup + readlink of the fresh fd)
-    P->>L: path_add_device again (same real path)
-    Note over P,R: rendering and all other devices keep working throughout
+    P->>S: forget_input: the resource is not ours any more
+    Note over D: the preempting client holds the display...
+    D->>P: Granted{Drm, card: 1} — the display is back
+    P->>P: rebuild the display stack on the fresh lease fd
+    P->>S: reacquire_inputs — every advertised device,<br/>"the display is back"
+    S-->>P: the resources granted now
+    P->>L: on_granted: add_granted (dup + readlink) then path_add_device
+    Note over P,R: the app the user is looking at has its pointer and keyboard again
 ```
+
+An input revoke can also arrive alone — the seat takes a device from a
+display-less holder — and is handled the same way: the registry entry goes, the
+session forgets the resource, and the device is added back if a grant follows.
+
+Two rules make the handover work:
+
+- **The re-acquire is triggered by the DISPLAY grant**, not by the input revokes:
+  asking while holding no display is exactly what the daemon denies, and the
+  display is what makes this client the seat again.
+- **`reacquire_inputs` ignores the "have I been offered this before" guard** that
+  `adopt_advertised` uses. That guard exists to stop a REFUSAL being repeated on
+  every push; after losing and regaining the screen the devices are very likely
+  free, and not asking leaves an app that is visible but has no pointer and no
+  keyboard.
+
+A device that merely went away is a different case entirely — no revoke at all,
+the session keeps holding it, and the daemon re-grants it when the device comes
+back ("A device the kernel takes away").
 
 ## Held keys and touches need no reset
 
