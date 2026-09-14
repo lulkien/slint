@@ -10,18 +10,21 @@ but receives no input (and libinput/libxkbcommon are not linked).
 
 ## Where the devices come from
 
-The daemon (separate process, root) enumerates `/dev/input/event*` once at
-startup, classifies each device (touch > mouse > keyboard, by capabilities),
-opens it, and advertises it as a `Resource::Input(...)`:
+The daemon (separate process, root) enumerates `/dev/input/event*`, classifies
+each device (touch > mouse > keyboard, by capabilities), opens it, and
+advertises it as a `Resource::Input(...)`:
 
 - `Input(Keyboard(n))` — a device with real typing keys,
 - `Input(Mouse(n))` — relative axes + buttons,
 - `Input(Touch(n))` — absolute/multi-touch axes.
 
-The backend acquires every advertised input alongside the DRM lease
-(best-effort — see architecture.md). There is **no udev and no hot-plug**: a
-device plugged after the daemon started is not advertised until the daemon
-restarts.
+It keeps that list reconciled with `/dev/input` while it runs (every couple of
+seconds, see @sgc's `docs/resource-manager.md`): a device that appears — or a
+node re-created by a udev trigger — is opened and advertised, and one that goes
+away is withdrawn. What stays per-connection is the advertise message itself, so
+an already-connected client is not told about a device that appears later; the
+backend acquires every advertised input alongside the DRM lease (best-effort —
+see architecture.md).
 
 ## The key trick: libinput over granted fds
 
@@ -191,17 +194,24 @@ legitimately held on another one.
 ## A device the kernel takes away
 
 An unplug — or a udev trigger, which installing anything with udev rules runs —
-removes or re-creates `/dev/input/eventN` under the running daemon. The daemon
-never reads an input device, so it cannot notice and keeps the fd it opened at
-startup: there is no @sgc event for this. libinput does notice (its dup gets
-`ENODEV`) and reports `DEVICE_REMOVED`; the backend then drops the registry entry
-(libinput already removed the device, so there is no `path_remove_device` to
-make), which is the one thing nothing else does — without it, a later revoke for
-that resource would try to remove a device libinput no longer knows:
+removes or re-creates `/dev/input/eventN` under the running daemon. Two things
+notice, independently:
 
-    linuxsgc: input: Input(Keyboard(0)) (input14) was removed by the kernel — dropping the grant;
-    restart the @sgc daemon to re-enumerate devices
+- the **daemon** reconciles its devices with `/dev/input` every couple of
+  seconds: the node is gone (or replaced by a different inode), so the resource
+  is withdrawn and whoever held it is revoked — a client that starts later never
+  receives a grant for a node that no longer exists;
+- **libinput**, reading the holder's dup, gets `ENODEV` and reports
+  `DEVICE_REMOVED`; the backend then drops the registry entry (libinput already
+  removed the device, so there is no `path_remove_device` to make) — without it,
+  a later revoke for that resource would try to remove a device libinput no
+  longer knows:
 
-The resource stays unusable until the daemon re-enumerates — input has no
-hot-plug. A grant that arrives afterwards for a path the daemon still holds (the
-node it opened is gone) is skipped at registration, see `add_granted`.
+      linuxsgc: input: Input(Keyboard(0)) (input14) was removed by the kernel — dropping the grant;
+      this client does not get it back without a restart
+
+Neither path gives the device back to the client that held it (a revoked input is
+permanent — see "A denied input is permanent"), so re-enumeration helps the next
+client rather than the running one. A grant that arrives for a path the daemon
+still holds (the node it opened is gone) is skipped at registration, see
+`add_granted`.

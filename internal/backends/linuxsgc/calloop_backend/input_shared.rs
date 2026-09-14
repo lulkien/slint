@@ -385,8 +385,9 @@ impl InputState {
     /// `path_remove_device` to make here (that would be a call on a dead
     /// handle). Without this the client keeps claiming a device that is gone:
     /// a later revoke for the same resource would try to remove a device
-    /// libinput no longer knows. The resource itself stays unusable until the
-    /// daemon re-enumerates the devices, which is what the log line says.
+    /// libinput no longer knows. The resource stays unusable for THIS client
+    /// (a revoked input is permanent — see docs/input.md); a client that starts
+    /// later is fine, the daemon reconciles its devices at runtime.
     pub fn on_device_removed(&self, device: &input::Device) {
         let sysname = device.sysname().to_string();
         let Some(removed) = self.registry.take_by_sysname(&sysname) else {
@@ -396,7 +397,7 @@ impl InputState {
             return;
         };
         println!(
-            "linuxsgc: input: {:?} ({sysname}) was removed by the kernel — dropping the grant; restart the @sgc daemon to re-enumerate devices",
+            "linuxsgc: input: {:?} ({sysname}) was removed by the kernel — dropping the grant; this client does not get it back without a restart",
             removed.resource
         );
     }
