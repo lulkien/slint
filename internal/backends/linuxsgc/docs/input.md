@@ -177,15 +177,22 @@ so, naming the device kind the app will be missing and what to do about it:
     the holder. Restart this app once that client releases the device, or run @sgc with its
     default fair-queue policy, where a newcomer preempts the holder instead
 
-Under the default `fair-queue` (and `latest-owner`) this cannot happen: a newcomer
-preempts the owner and the acquire succeeds. The case is `first-owner` — the
-kiosk policy — where denial is the intended behaviour and the app must be
-restarted to pick the device up after the holder leaves. Retrying the acquire is
-deliberately NOT done: under a preemptive policy an acquire steals the device, so
-an automatic retry would be a retry-steal, and today's policies only deny when
-they also never preempt. One exception, and it is not a retry: losing and
-regaining the display re-asks for every advertised device ("The seat changes
+Input is owned by CLASS, not by the seat alone. A client holding a display is the
+SEAT, and the seat TAKES a device somebody else holds with the policy bypassed —
+under `first-owner` too — so an app like this one (sgc-or-die: it always holds
+`Drm`) is denied only when the device is suspended (its device is away and its
+holder keeps it) or when two seats collide, which is unreachable today. A client
+WITHOUT a display ranks last: it may hold a device nobody else holds, it is denied
+one somebody holds, and it never queues. Retrying the acquire is deliberately NOT
+done: an automatic retry would be a retry-steal for the seat, and today's policies
+only deny when they never preempt. One exception, and it is not a retry: losing
+and regaining the display re-asks for every advertised device ("The seat changes
 hands"), so a refusal lasts only as long as the app keeps the seat.
+
+A QUEUED acquire is not a denial. When the daemon queues the request — it pushes
+the holder's `Revoke` and answers `Queued` — `libsgc-rs` returns
+`SgcError::Queued`, and the log line above is premature: the `Grant` arrives
+through `pump` as `SgcEvent::Granted` a moment later.
 
 ## The seat changes hands
 
