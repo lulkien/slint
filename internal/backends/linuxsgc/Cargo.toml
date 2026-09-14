@@ -55,8 +55,9 @@ i-slint-renderer-femtovg = { workspace = true, features = ["default"], optional 
 i-slint-renderer-software = { workspace = true, optional = true }
 # sgc: the backend drives its own session against the simple-graphics-controller
 # daemon (connect @sgc, acquire the card lease, pump revoke/re-grant). The
-# client library lives in its own repo and is fetched as a git ref.
-libsgc-rs = { git = "https://github.com/lulkien/libsgc-rs.git" }
+# client library comes from crates.io: a published version resolves for every
+# consumer of this fork, git or local, with no sibling checkout needed.
+libsgc-rs = "0.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 input = { workspace = true, default-features = false, features = ["libinput_1_21"], optional = true }
