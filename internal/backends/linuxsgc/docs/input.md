@@ -189,10 +189,14 @@ only deny when they never preempt. One exception, and it is not a retry: losing
 and regaining the display re-asks for every advertised device ("The seat changes
 hands"), so a refusal lasts only as long as the app keeps the seat.
 
-A QUEUED acquire is not a denial. When the daemon queues the request — it pushes
-the holder's `Revoke` and answers `Queued` — `libsgc-rs` returns
-`SgcError::Queued`, and the log line above is premature: the `Grant` arrives
-through `pump` as `SgcEvent::Granted` a moment later.
+A QUEUED acquire is not a denial, and is not reported as one. When the daemon
+queues the request — it pushes the holder's `Revoke` and answers `Queued` —
+`libsgc-rs` returns `SgcError::Queued`, and the backend says so instead of
+promising the app will never see the device:
+
+    linuxsgc: cannot take Input(Keyboard(2)) yet — the daemon queued the request (it is
+    revoking whoever holds the device): the keyboard arrives through the event loop a moment
+    later. This is not a denial
 
 ## The seat changes hands
 

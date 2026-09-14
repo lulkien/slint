@@ -252,10 +252,16 @@ fn sgc_err(err: SgcError) -> PlatformError {
 ///
 /// A denial is permanent for this process — the daemon keeps no memory of the
 /// request and the protocol has no "tell me when it is free" — and it is only
-/// reachable under a policy that never preempts (`first-owner`); under
-/// fair-queue a newcomer takes the device over instead. So the message names the
-/// device, the daemon's reason, the events the app will never see, and both ways
-/// out.
+/// reachable when the device is suspended (its device is away and its holder
+/// keeps it) or when two seats collide, which is unreachable today — this app
+/// holds `Drm`, so it is the seat, and the seat takes a held device with the
+/// policy bypassed. So the message names the device, the daemon's reason, the
+/// events the app will never see, and both ways out.
+///
+/// A QUEUED acquire is not a denial and must not be reported as one: the daemon
+/// answers it with nothing at all (`AcquireOutcome::Queued`), the request waits
+/// only for its own reply, and the `Grant` arrives through the event loop a
+/// moment later.
 #[cfg(feature = "libinput")]
 fn report_input_refusal(input: &Resource, err: &SgcError) {
     let kind = match input {
@@ -265,6 +271,11 @@ fn report_input_refusal(input: &Resource, err: &SgcError) {
         _ => "input",
     };
     match err {
+        SgcError::Queued { .. } => eprintln!(
+            "linuxsgc: cannot take {input:?} yet — the daemon queued the request (it is \
+             revoking whoever holds the device): the {kind} arrives through the event loop \
+             a moment later. This is not a denial"
+        ),
         SgcError::Denied { reason } => eprintln!(
             "linuxsgc: cannot take {input:?} — the daemon denied it ({reason}). \
              This app will receive no {kind} events for its whole lifetime: another \
