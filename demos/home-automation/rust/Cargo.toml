@@ -19,11 +19,24 @@ path = "lib.rs"
 name = "home_automation_lib"
 
 [dependencies]
-slint = { path = "../../../api/rs/slint", features = ["backend-android-activity-06"] }
+slint = { path = "../../../api/rs/slint", default-features = false, features = ["compat-1-2"] }
 chrono = "0.4"
 
 [features]
+# Preserve the upstream default build (slint defaults + the android backend).
+default = ["slint/default", "slint/backend-android-activity-06"]
 sw-renderer = []
+## sgc fork: fullscreen on an @sgc DRM lease via the linuxsgc backend,
+## pointer/keyboard/touch from the daemon-granted devices (libinput). gnu
+## builds only (libinput + xkbcommon are runtime deps):
+##   software (CPU):  --no-default-features --features "sgc"
+##   gl (femtovg):    --no-default-features --features "sgc-femtovg"
+##                    (Mali/panfrost: needs mesa libgbm/EGL/GLES on the board)
+sgc-base = ["slint/backend-linuxsgc", "slint/backend-linuxsgc-libinput", "slint/std"]
+sgc = ["sgc-base", "slint/renderer-software"]
+sgc-femtovg = ["sgc-base", "slint/renderer-femtovg"]
+input = ["slint/backend-linuxsgc-libinput"]
+
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = { version = "0.2" }

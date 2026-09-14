@@ -33,3 +33,12 @@ slint-build = { path = "../../api/rs/build" }
 default = ["slint/default", "network", "chrono", "slint/backend-android-activity-06"]
 simulator = ["mcu-board-support", "slint/renderer-software", "slint/backend-winit", "slint/std"]
 network = ["dep:reqwest", "dep:serde", "tokio"]
+## sgc fork: fullscreen on an @sgc DRM lease via the linuxsgc backend, with
+## pointer/keyboard/touch from the daemon-granted devices (libinput). Board
+## builds (dynamically linked gnu; libinput + xkbcommon are runtime deps):
+##   software (CPU):  --no-default-features --features "sgc,chrono"
+##   gl (femtovg):    --no-default-features --features "sgc-femtovg,chrono"
+##                    (Mali/panfrost: needs mesa libgbm/EGL/GLES on the board)
+sgc-base = ["slint/backend-linuxsgc", "slint/backend-linuxsgc-libinput", "slint/std"]
+sgc = ["sgc-base", "slint/renderer-software"]
+sgc-femtovg = ["sgc-base", "slint/renderer-femtovg"]
