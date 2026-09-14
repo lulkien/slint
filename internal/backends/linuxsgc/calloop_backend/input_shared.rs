@@ -79,6 +79,19 @@ pub struct GrantedInput {
     add_failed: bool,
 }
 
+impl GrantedInput {
+    /// Does the fd behind this entry point at a node that is gone? The kernel
+    /// marks the resolved path of an unlinked devnode with " (deleted)", which
+    /// is how the daemon tells a dead device from a live one too.
+    fn node_is_gone(&self) -> bool {
+        match std::fs::read_link(format!("/proc/self/fd/{}", self.fd.as_raw_fd())) {
+            Ok(path) => path.to_string_lossy().ends_with(" (deleted)"),
+            // Cannot tell: treat it as gone (what this code did before).
+            Err(_) => true,
+        }
+    }
+}
+
 /// The granted-device table, shared between the libinput interface (which
 /// looks fds up by path while a device is opened), the seed path and the sgc
 /// pump routing. Clone = another Rc to the same table.
@@ -88,9 +101,13 @@ pub struct InputRegistry(Rc<RefCell<Vec<GrantedInput>>>);
 impl InputRegistry {
     /// Register one granted device. The caller hands over a fresh dup of the
     /// granted fd; this stores it, resolves the real device path and applies
-    /// O_NONBLOCK. Failure (unresolvable path, duplicate) is logged and the
+    /// O_NONBLOCK. Failure (unresolvable path, stale fd) is logged and the
     /// device skipped — input is best-effort by design.
-    fn add_granted(&self, resource: Resource, fd: OwnedFd) {
+    ///
+    /// A grant for a resource or a path that already has an entry replaces it
+    /// (the daemon re-grants a device that came back under the same name), and
+    /// returns the libinput handles the caller has to drop from the seat.
+    fn add_granted(&self, resource: Resource, fd: OwnedFd) -> Vec<input::Device> {
         // The dup shares the daemon's open file description, so
         // /proc/self/fd/<fd> resolves to the real /dev/input/eventN.
         let Ok(path) = std::fs::read_link(format!("/proc/self/fd/{}", fd.as_raw_fd())) else {
@@ -98,26 +115,26 @@ impl InputRegistry {
                 "linuxsgc: input: cannot resolve the device path of granted {resource:?} (fd {}) — skipping",
                 fd.as_raw_fd()
             );
-            return;
+            return Vec::new();
         };
         if !path.is_absolute() {
             eprintln!(
                 "linuxsgc: input: granted {resource:?} resolved to non-device path {path:?} — skipping"
             );
-            return;
+            return Vec::new();
         }
         // A node re-created under the daemon — a udev trigger (installing
         // anything with udev rules runs one) or a replug — leaves the resolved
         // path carrying the kernel's " (deleted)" marker: the daemon still holds
         // the OLD inode. libinput refuses such a path ("client bug: Invalid
         // path") and retrying it can never succeed, so skip the device instead
-        // of registering it as pending. Input has no hot-plug: a daemon restart
-        // re-opens the current nodes.
+        // of registering it as pending. This fd is a stale one the daemon will
+        // replace: the next grant for this resource carries the current node.
         if path.to_string_lossy().ends_with(" (deleted)") {
             eprintln!(
-                "linuxsgc: input: granted {resource:?} resolves to {path:?} — the device node was re-created after the daemon opened it (stale fd); skipping it. Restart the daemon to re-enumerate the current nodes"
+                "linuxsgc: input: granted {resource:?} resolves to {path:?} — the device node was re-created after the daemon opened it (stale fd); waiting for the daemon to re-grant it"
             );
-            return;
+            return Vec::new();
         }
 
         // O_NONBLOCK is a file-description flag: it lands on the open file
@@ -129,13 +146,32 @@ impl InputRegistry {
             eprintln!(
                 "linuxsgc: input: cannot set fd flags of granted {resource:?} (errno {errno}) — skipping"
             );
-            return;
+            return Vec::new();
         }
 
         let mut devices = self.0.borrow_mut();
-        if devices.iter().any(|granted| granted.path == path) {
-            eprintln!("linuxsgc: input: duplicate device path {path:?} — skipping");
-            return;
+        // A grant for a resource (or a path) we already have an entry for is a
+        // device coming BACK or being replaced: the daemon re-grants the same
+        // name with a fresh fd, and the entry it leaves behind — whose fd is the
+        // device that went away — must not shadow it.
+        let stale: Vec<usize> = devices
+            .iter()
+            .enumerate()
+            .filter(|(_, granted)| granted.resource == resource || granted.path == path)
+            .map(|(index, _)| index)
+            .collect();
+        let mut replaced = Vec::new();
+        for index in stale.into_iter().rev() {
+            let old = devices.remove(index);
+            if let Some(device) = old.device {
+                // libinput still holds this handle: the caller takes it off the
+                // seat, or the app would keep a device nothing arrives from.
+                replaced.push(device);
+            }
+            println!(
+                "linuxsgc: input: {resource:?}: dropping the {:?} entry it replaces",
+                old.resource
+            );
         }
         println!("linuxsgc: input: registered granted {resource:?}: {}", path.display());
         devices.push(GrantedInput {
@@ -146,6 +182,7 @@ impl InputRegistry {
             sysname: None,
             add_failed: false,
         });
+        replaced
     }
 
     /// The granted device libinput asked to open, found by path.
@@ -188,10 +225,24 @@ impl InputRegistry {
     /// Take the entry libinput just reported as removed (the kernel took the
     /// device away: an unplug, or a udev trigger that re-created the node).
     /// Matched by sysname; returns `None` when the device is not one of ours.
-    fn take_by_sysname(&self, sysname: &str) -> Option<GrantedInput> {
+    ///
+    /// The node behind the entry has to be gone as well. A device that goes away
+    /// and comes back lands on the SAME node path, so its sysname is the one the
+    /// removal event of the device it replaced carries — and that event can
+    /// arrive AFTER the daemon has already re-granted the new one. Dropping the
+    /// fresh entry then would take away the device the app just got back, with
+    /// nothing left to bring it back a second time.
+    fn take_removed_by_sysname(&self, sysname: &str) -> Option<GrantedInput> {
         let mut devices = self.0.borrow_mut();
         let index =
             devices.iter().position(|granted| granted.sysname.as_deref() == Some(sysname))?;
+        if !devices[index].node_is_gone() {
+            println!(
+                "linuxsgc: input: a removal arrived for {sysname}, but {:?} is a device that came back — keeping it",
+                devices[index].resource
+            );
+            return None;
+        }
         Some(devices.remove(index))
     }
 
@@ -271,9 +322,13 @@ impl InputState {
     /// Best-effort like the acquisition itself: a device that cannot be
     /// registered is logged and skipped, never fatal.
     pub fn seed_from_session(&self, session: &SgcSession) {
-        for resource in &session.inputs {
+        for resource in session.inputs.borrow().iter() {
             match session.fd(resource) {
-                Ok(fd) => self.registry.add_granted(resource.clone(), fd),
+                Ok(fd) => {
+                    for device in self.registry.add_granted(resource.clone(), fd) {
+                        self.libinput.clone().path_remove_device(device);
+                    }
+                }
                 Err(err) => {
                     eprintln!("linuxsgc: input: cannot dup {resource:?} for libinput: {err}")
                 }
@@ -341,7 +396,11 @@ impl InputState {
     /// to libinput. Runs on the event-loop thread (the sgc pump callback);
     /// a failure logs and the grant is dropped — never fatal.
     pub fn on_granted(&self, resource: Resource, fd: OwnedFd) {
-        self.registry.add_granted(resource, fd);
+        for device in self.registry.add_granted(resource, fd) {
+            // A device this resource replaced: libinput still knows the old
+            // handle, and the app must not keep receiving nothing from it.
+            self.libinput.clone().path_remove_device(device);
+        }
         self.add_pending_devices();
     }
 
@@ -376,28 +435,29 @@ impl InputState {
     }
 
     /// Handle a device libinput reports as REMOVED: the kernel took it away
-    /// (an unplug, or a udev trigger that re-created the node) while the daemon
-    /// still holds — and still considers granted — the fd it opened at startup.
-    /// No @sgc event covers this: the daemon never reads an input device, so it
-    /// cannot notice that the device died.
+    /// (an unplug, or a udev trigger that re-created the node).
     ///
-    /// Drop the entry — libinput has already removed the device, so there is no
-    /// `path_remove_device` to make here (that would be a call on a dead
-    /// handle). Without this the client keeps claiming a device that is gone:
-    /// a later revoke for the same resource would try to remove a device
-    /// libinput no longer knows. The resource stays unusable for THIS client
-    /// (a revoked input is permanent — see docs/input.md); a client that starts
-    /// later is fine, the daemon reconciles its devices at runtime.
+    /// Drop the libinput entry — libinput has already removed the device, so
+    /// there is no `path_remove_device` to make here (that would be a call on a
+    /// dead handle). Without this the client keeps claiming a device that is
+    /// gone: a later revoke for the same resource would try to remove a device
+    /// libinput no longer knows.
+    ///
+    /// The GRANT is not affected. Input is not revoked because a device was
+    /// unplugged: the @sgc daemon suspends the resource, its holder keeps it,
+    /// and when the device comes back the daemon re-grants the same resource
+    /// with a fresh fd ([`SgcEvent::Granted`]) — this client then registers the
+    /// device again in [`Self::add_granted`] and adds it back to libinput.
     pub fn on_device_removed(&self, device: &input::Device) {
         let sysname = device.sysname().to_string();
-        let Some(removed) = self.registry.take_by_sysname(&sysname) else {
+        let Some(removed) = self.registry.take_removed_by_sysname(&sysname) else {
             // Not a device we granted, or a second event for one already
             // dropped (our own `path_remove_device` on a revoke reports one
             // too — that entry is already gone).
             return;
         };
         println!(
-            "linuxsgc: input: {:?} ({sysname}) was removed by the kernel — dropping the grant; this client does not get it back without a restart",
+            "linuxsgc: input: {:?} ({sysname}) was removed by the kernel — dropped from libinput; the grant is kept and the device comes back to this client",
             removed.resource
         );
     }

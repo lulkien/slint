@@ -194,6 +194,10 @@ impl SharedState {
             SgcEvent::Granted { resource: resource @ Resource::Input(_), fd } => {
                 self.input_state.on_granted(resource, fd);
             }
+            // A pushed resource list: handled by `pump_sgc` (which has the
+            // session) when input support is compiled in; without it there is
+            // nothing a changed list could be acted on with.
+            SgcEvent::Advertised { .. } => {}
             other => {
                 eprintln!("linuxsgc: ignoring {other:?} — not a resource this backend holds");
             }
@@ -208,7 +212,19 @@ impl SharedState {
 fn pump_sgc(shared: &SharedState, session: &SgcSession) -> Result<(), PlatformError> {
     loop {
         match session.pump()? {
-            Some(event) => shared.on_sgc_event(event)?,
+            Some(event) => {
+                // A pushed resource list is session-level work (acquire what is
+                // new, register it with libinput) rather than display state, so
+                // it is handled here where the session is in reach. Built
+                // without input support there is nothing a changed list can be
+                // acted on with, and `on_sgc_event` ignores it.
+                #[cfg(feature = "libinput")]
+                if let SgcEvent::Advertised { available_resources } = &event {
+                    adopt_advertised_inputs(shared, session, available_resources);
+                    continue;
+                }
+                shared.on_sgc_event(event)?
+            }
             None => {
                 // Retry input devices libinput has not accepted yet. A re-grant
                 // can name a path libinput has not finished removing (its
@@ -220,6 +236,23 @@ fn pump_sgc(shared: &SharedState, session: &SgcSession) -> Result<(), PlatformEr
                 shared.input_state.add_pending_devices();
                 return Ok(());
             }
+        }
+    }
+}
+
+/// A device appeared while the app is running: the daemon pushed a new resource
+/// list, so acquire what is new and hand it to libinput.
+///
+/// Runs on the event-loop thread (libinput is not thread-safe, and the add opens
+/// the device synchronously through the interface). A device that LEAVES the
+/// list needs nothing here — the daemon revokes its holder (that arrives as
+/// `Revoked`) or libinput reports `DEVICE_REMOVED` on the holder's own fd.
+#[cfg(feature = "libinput")]
+fn adopt_advertised_inputs(shared: &SharedState, session: &SgcSession, advertised: &[Resource]) {
+    for resource in session.adopt_advertised(advertised) {
+        match session.fd(&resource) {
+            Ok(fd) => shared.input_state.on_granted(resource, fd),
+            Err(err) => eprintln!("linuxsgc: input: cannot dup {resource:?} for libinput: {err}"),
         }
     }
 }

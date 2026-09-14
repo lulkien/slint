@@ -34,9 +34,18 @@ pub struct SgcSession {
     /// block other clients (the daemon's first-owner policy). Acquisition is
     /// best-effort — a keyboard-less UI is fine, the DRM lease is the only
     /// hard requirement — so failed input acquires are logged and the session
-    /// continues without the device.
+    /// continues without the device. A `RefCell` because a device plugged in
+    /// while the app runs is acquired later (see [`SgcSession::adopt_advertised`]).
     #[cfg(feature = "libinput")]
-    pub inputs: Vec<Resource>,
+    pub inputs: RefCell<Vec<Resource>>,
+    /// Every resource the daemon has offered this session: the connect-time
+    /// list plus every pushed one. A resource we were refused is asked for again
+    /// only if it leaves the list and comes back — the daemon keeps no memory of
+    /// the request and the policy that refused us would refuse us again, so
+    /// re-asking on every push would only repeat the message and hammer the
+    /// daemon's log.
+    #[cfg(feature = "libinput")]
+    offered: RefCell<Vec<Resource>>,
 }
 
 impl SgcSession {
@@ -89,14 +98,8 @@ impl SgcSession {
         let inputs = {
             let mut inputs = Vec::new();
             for input in &advertised {
-                let Resource::Input(input_resource) = input else {
+                let Resource::Input(_) = input else {
                     continue;
-                };
-                // What the device feeds the app, for the messages below.
-                let kind = match input_resource {
-                    InputResource::Mouse(_) => "pointer",
-                    InputResource::Keyboard(_) => "keyboard",
-                    InputResource::Touch(_) => "touch",
                 };
                 println!("linuxsgc: acquiring {input:?} from @sgc...");
                 match client.acquire(input.clone()) {
@@ -104,20 +107,7 @@ impl SgcSession {
                         println!("linuxsgc: {input:?} granted");
                         inputs.push(input.clone());
                     }
-                    // Someone else holds it and the daemon's policy for that
-                    // resource is non-preemptive (first-owner): a newcomer is
-                    // denied instead of taking it over.
-                    Err(SgcError::Denied { reason }) => eprintln!(
-                        "linuxsgc: cannot take {input:?} — the daemon denied it ({reason}). \
-                         This app will receive no {kind} events for its whole lifetime: another \
-                         client holds the device and the daemon's policy is first-owner, which \
-                         denies a newcomer rather than preempting the holder. Restart this app \
-                         once that client releases the device, or run @sgc with its default \
-                         fair-queue policy, where a newcomer preempts the holder instead"
-                    ),
-                    Err(err) => eprintln!(
-                        "linuxsgc: cannot take {input:?} — {err}. This app will receive no {kind} events"
-                    ),
+                    Err(err) => report_input_refusal(input, &err),
                 }
             }
             inputs
@@ -128,8 +118,56 @@ impl SgcSession {
             resource,
             card,
             #[cfg(feature = "libinput")]
-            inputs,
+            inputs: RefCell::new(inputs),
+            #[cfg(feature = "libinput")]
+            offered: RefCell::new(advertised),
         })
+    }
+
+    /// Adopt a resource list the daemon pushed after we connected: acquire the
+    /// input devices we have not been offered before, and return the ones
+    /// granted now (the caller hands them to libinput).
+    ///
+    /// This is how a device plugged in AFTER the app started reaches it — the
+    /// connect-time view was a snapshot, and the daemon pushes its list whenever
+    /// it changes. Two things need nothing here:
+    ///
+    /// - a resource that leaves the list: the daemon suspends it (its holder
+    ///   keeps it — we are that holder) or revokes it ([`SgcEvent::Revoked`]),
+    ///   and libinput reports `DEVICE_REMOVED` for a device we lose either way;
+    /// - a resource that comes back on the list: we still hold it, so the daemon
+    ///   re-grants it to us on its own and the acquire below skips it.
+    #[cfg(feature = "libinput")]
+    pub fn adopt_advertised(&self, advertised: &[Resource]) -> Vec<Resource> {
+        let new: Vec<Resource> = advertised
+            .iter()
+            .filter(|resource| {
+                matches!(resource, Resource::Input(_))
+                    && !self.offered.borrow().contains(resource)
+                    && !self.inputs.borrow().contains(resource)
+            })
+            .cloned()
+            .collect();
+        *self.offered.borrow_mut() = advertised.to_vec();
+        if new.is_empty() {
+            return Vec::new();
+        }
+
+        let mut client = self.client.borrow_mut();
+        let mut inputs = self.inputs.borrow_mut();
+        let mut granted = Vec::new();
+        for input in new {
+            println!("linuxsgc: acquiring {input:?} from @sgc (appeared while running)...");
+            match client.acquire(input.clone()) {
+                Ok(()) => {
+                    println!("linuxsgc: {input:?} granted");
+                    inputs.push(input.clone());
+                    granted.push(input);
+                }
+                Err(err) => report_input_refusal(&input, &err),
+            }
+        }
+        granted
     }
 
     /// Non-blocking protocol pump: returns one event if the server sent one,
@@ -157,4 +195,35 @@ impl SgcSession {
 
 fn sgc_err(err: SgcError) -> PlatformError {
     PlatformError::Other(format!("sgc: {err}"))
+}
+
+/// Say why an input device did not arrive, and what it costs the app.
+///
+/// A denial is permanent for this process — the daemon keeps no memory of the
+/// request and the protocol has no "tell me when it is free" — and it is only
+/// reachable under a policy that never preempts (`first-owner`); under
+/// fair-queue a newcomer takes the device over instead. So the message names the
+/// device, the daemon's reason, the events the app will never see, and both ways
+/// out.
+#[cfg(feature = "libinput")]
+fn report_input_refusal(input: &Resource, err: &SgcError) {
+    let kind = match input {
+        Resource::Input(InputResource::Mouse(_)) => "pointer",
+        Resource::Input(InputResource::Keyboard(_)) => "keyboard",
+        Resource::Input(InputResource::Touch(_)) => "touch",
+        _ => "input",
+    };
+    match err {
+        SgcError::Denied { reason } => eprintln!(
+            "linuxsgc: cannot take {input:?} — the daemon denied it ({reason}). \
+             This app will receive no {kind} events for its whole lifetime: another \
+             client holds the device and the daemon's policy is first-owner, which \
+             denies a newcomer rather than preempting the holder. Restart this app \
+             once that client releases the device, or run @sgc with its default \
+             fair-queue policy, where a newcomer preempts the holder instead"
+        ),
+        err => eprintln!(
+            "linuxsgc: cannot take {input:?} — {err}. This app will receive no {kind} events"
+        ),
+    }
 }

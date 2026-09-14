@@ -18,13 +18,14 @@ advertises it as a `Resource::Input(...)`:
 - `Input(Mouse(n))` — relative axes + buttons,
 - `Input(Touch(n))` — absolute/multi-touch axes.
 
-It keeps that list reconciled with `/dev/input` while it runs (every couple of
-seconds, see @sgc's `docs/resource-manager.md`): a device that appears — or a
-node re-created by a udev trigger — is opened and advertised, and one that goes
-away is withdrawn. What stays per-connection is the advertise message itself, so
-an already-connected client is not told about a device that appears later; the
-backend acquires every advertised input alongside the DRM lease (best-effort —
-see architecture.md).
+It keeps that list reconciled with `/dev/input` while it runs (an inotify watch,
+see @sgc's `docs/resource-manager.md`): a device that appears — or a node
+re-created by a udev trigger — is opened and advertised, one that goes away is
+suspended for whoever holds it, and every change is pushed to the connections
+that are already up, so a client that connected earlier IS told about a device
+that appears later (see "A device that appears while the app runs"). The backend
+acquires every advertised input alongside the DRM lease (best-effort — see
+architecture.md).
 
 ## The key trick: libinput over granted fds
 
@@ -132,6 +133,37 @@ the event loop — a useful end-to-end test signal on the board.
 An optional `libinput_event_hook` (backend builder, feature `libinput`) can
 filter/consume raw events before dispatch.
 
+## A device that appears while the app runs
+
+The daemon pushes its resource list again whenever it changes (a device plugged
+in, a device removed), and that push is the only way a connection that is already
+up can learn about a device that appeared after it connected — its view at
+`connect` was a snapshot. `libsgc-rs` surfaces the push as
+[`SgcEvent::Advertised`], and the backend adopts it:
+
+- `SgcSession::adopt_advertised` acquires the `Input(_)` entries it has NOT been
+  offered before and returns them; the pump registers each one with libinput
+  (`InputState::on_granted`) on the event-loop thread — the same path a startup
+  device takes, just later.
+- "Not offered before" is what keeps a refusal from being repeated: the daemon
+  keeps no memory of a request and the policy that refused one resource refuses
+  it again, so re-asking on every push would only refill the log. A device that
+  leaves the list and comes back IS asked for again (its holder may be gone by
+  then).
+- A resource that leaves the list needs nothing here: it was suspended (its
+  device went away — this client keeps it, and the daemon re-grants it when the
+  device returns) or revoked (`Revoked`), and in both cases libinput reports
+  `DEVICE_REMOVED` on the holder's own fd — see "A device the kernel takes away".
+- A resource that comes BACK on the list is not acquired either: if this client
+  still holds it, the daemon re-grants it on its own, and `adopt_advertised`
+  skips what is already in `session.inputs`.
+- The lease is unaffected: this backend holds `Drm { card: N }` for its lifetime,
+  so a change concerning a DRM card is not something it acts on.
+
+A build without the `libinput` feature ignores the event (there is nothing it
+could consume), which is the same rule as at connect: a client that cannot
+consume a resource must not hold it.
+
 ## A denied input is permanent
 
 Inputs are acquired once, at `connect_and_acquire`, and a refusal is not retried
@@ -197,21 +229,42 @@ An unplug — or a udev trigger, which installing anything with udev rules runs 
 removes or re-creates `/dev/input/eventN` under the running daemon. Two things
 notice, independently:
 
-- the **daemon** reconciles its devices with `/dev/input` every couple of
-  seconds: the node is gone (or replaced by a different inode), so the resource
-  is withdrawn and whoever held it is revoked — a client that starts later never
-  receives a grant for a node that no longer exists;
+- the **daemon** reconciles its devices with `/dev/input` (inotify, plus a 60 s
+  safety pass). A node that is gone AND whose device is gone SUSPENDS the
+  resource: it leaves the advertised list, keeps its holder, and is handed back
+  to that same client when the device returns (fresh fd, same name, no
+  re-acquire). Nothing is revoked for a device leaving the machine — an app that
+  is on screen with a mouse must not lose the mouse because the mouse was
+  unplugged. A udev trigger that re-creates the node for a device that never
+  moved is not even that: the daemon replaces its OWN fd and the holder's dup
+  keeps working;
 - **libinput**, reading the holder's dup, gets `ENODEV` and reports
-  `DEVICE_REMOVED`; the backend then drops the registry entry (libinput already
-  removed the device, so there is no `path_remove_device` to make) — without it,
-  a later revoke for that resource would try to remove a device libinput no
-  longer knows:
+  `DEVICE_REMOVED`; the backend then drops the libinput entry — libinput has
+  already removed the device, so there is no `path_remove_device` to make — while
+  KEEPING the resource's claim, because the daemon is about to hand it back:
 
-      linuxsgc: input: Input(Keyboard(0)) (input14) was removed by the kernel — dropping the grant;
-      this client does not get it back without a restart
+      linuxsgc: input: Input(Keyboard(0)) (event6) was removed by the kernel — dropped from libinput;
+      the grant is kept and the device comes back to this client
 
-Neither path gives the device back to the client that held it (a revoked input is
-permanent — see "A denied input is permanent"), so re-enumeration helps the next
-client rather than the running one. A grant that arrives for a path the daemon
-still holds (the node it opened is gone) is skipped at registration, see
-`add_granted`.
+The device then comes back as an unsolicited `Granted` (a `Grant` with no
+acquire: the daemon resumed the resource for its holder), and the pump hands it
+to `InputState::on_granted`, the same path a startup device or a preemption
+re-grant takes. From the app's point of view the pointer stops and then works
+again: no restart, no re-acquire, and no window in which another client could
+take the name.
+
+### The race this has, and how it is closed
+
+A device that goes away and comes back lands on the SAME node path, so the
+removal event for the device it replaced carries the same sysname as the fresh
+entry — and it can arrive AFTER the re-grant has been registered. Dropping the
+entry by sysname alone would take away the device the app just got back, with
+nothing left to bring it back a second time. `InputRegistry::take_removed_by_sysname`
+therefore also checks the entry's own fd: if it still resolves to a live node
+(`readlink /proc/self/fd/N` carries no ` (deleted)` marker), the removal belongs
+to a device this entry replaced, and the entry is kept:
+
+    linuxsgc: input: a removal arrived for event6, but Input(Keyboard(2)) is a device that came back — keeping it
+
+A grant whose fd still resolves to a deleted node (the daemon has not re-opened
+the re-created node yet) is skipped at registration — see `add_granted`.
